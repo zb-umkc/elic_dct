@@ -4,28 +4,28 @@ import os
 import time
 
 home_path = os.getenv("HOME")
-data_path = home_path
+
 # Training settings
 parser = argparse.ArgumentParser(description="SAREliC compression")
-parser.add_argument("--mode", type=str, default="train",
+parser.add_argument("--mode", type=str, default="test",
                     help="train or test (default: %(default)s)")
-parser.add_argument("--primary_pol", type=str, default='HV',
+parser.add_argument("--primary_pol", type=str, default='HH',
                     help="Primary polarization to use `VV` or `HH` or `VH` or `HV` (default: %(default)s)")
-parser.add_argument("--lambda", dest="lmbda", type=float, default=10,
+parser.add_argument("--lambda", dest="lmbda", type=float, default=4,
                     help="Bit-rate distortion parameter (default: %(default)s)")
 parser.add_argument("--loss", type=int, default=1,
                     help = "1: MSE, 2: L1, 3: I/Q loss, 4: NMSE loss, 5: Corr Loss (default: %(default)s)")
-parser.add_argument("--train-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/train', 
+parser.add_argument("--train-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/train_NGA_multi_pol_ps256', 
                     help="Training dataset path")
-parser.add_argument("--validation-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/validation', 
+parser.add_argument("--validation-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/validation_NGA_multi_pol_ps256', 
                     help="Validation dataset path")
-parser.add_argument("--test-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/test', #validation_NGA_multi_pol_ps256',#
+parser.add_argument("--test-dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol/test_NGA_multi_pol_ps1024', #validation_NGA_multi_pol_ps256', #  
                     help="Test dataset path")
-parser.add_argument('--checkpoint', type=str, default='PythonDir/SAREliC-Compression/checkpoint-NGA-HV',
+parser.add_argument('--checkpoint', type=str, default='PythonDir/SAREliC-Compression-master/checkpoint-NGA-10-groups',
                     help='Path to save the checkpoint, use different path for different experiments')
 parser.add_argument("--save_encoded", default="./encodedbinaries/",
                     help="save the encoded files, path to the directory or None to not save data")
-parser.add_argument("--test-model", type=str, default="/home/smmnr/PythonDir/SAREliC-Compression/checkpoint-NGA-HV/NGA_IQ_DCTv2_MST_p256b16_N192M320_loss1_lmbda1.00/checkpoint_best_loss_66.pth.tar",
+parser.add_argument("--test-model", type=str, default="/home/pmc4p/PythonDir/SAREliC-Compression-master/checkpoint-NGA-DCTv2/checkpoint_best_lambda4.pth.tar",
                     help="checkpoint path during testing")
 parser.add_argument("--dataset", type=str, default='NGA', 
                     help='Dataloader to use `NGA`or `Sandia` or `JPL` % (default: %(default)s)')
@@ -63,7 +63,7 @@ parser.add_argument("--test-batch-size", type=int, default=1,
                     help="Test batch size (default: %(default)s)")
 parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256),
                     help="Size of the patches to be cropped (default: %(default)s)")
-parser.add_argument("--cuda", action="store_true", default=False,
+parser.add_argument("--cuda", action="store_true", default=True,
                     help="Use cuda")
 parser.add_argument("--save", action="store_true", default=True, 
                     help="Save model to disk")
@@ -78,11 +78,11 @@ parser.add_argument("-c", "--entropy-coder", choices=compressai.available_entrop
 args = parser.parse_args()
 
 if args.mode == "train":
-    args.train_dataset = os.path.join(data_path, args.train_dataset)
+    args.train_dataset = os.path.join(home_path, args.train_dataset)
     assert os.path.exists(args.train_dataset), "Training dataset path not found"
-    args.validation_dataset = os.path.join(data_path, args.validation_dataset)
-    assert os.path.exists(args.validation_dataset), "Validation 16dataset path not found"
-    args.checkpoint = os.path.join(data_path, args.checkpoint)
+    args.validation_dataset = os.path.join(home_path, args.validation_dataset)
+    assert os.path.exists(args.validation_dataset), "Validation dataset path not found"
+    args.checkpoint = os.path.join(home_path, args.checkpoint)
     #assert os.path.exists(args.checkpoint), "Checkpoint path not found"
     args.checkpoint = os.path.join(args.checkpoint, "%s_%s_DCTv2_MST_p%db%d_N%dM%d_loss%d_lmbda%.2f"%(args.dataset, args.datatype, args.patch_size[0], args.batch_size, args.N, args.M, args.loss, args.lmbda))
     if os.path.exists(args.checkpoint):
@@ -97,7 +97,7 @@ if args.mode == "train":
         for key, value in args._get_kwargs():
             f.write(f"{key}: {value}\n")
 else:
-    args.test_dataset = os.path.join(data_path, args.test_dataset)
+    args.test_dataset = os.path.join(home_path, args.test_dataset)
     assert os.path.exists(args.test_dataset), "test dataset path not found"
     args.patch_size = (1024, 1024)
-    #assert os.path.exists(args.test_model), "Test model path not found"
+    # assert os.path.exists(args.test_model), "Test model path not found"

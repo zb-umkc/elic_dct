@@ -26,9 +26,9 @@ from ELICUtilis.models.NetworkDCT_v2 import SAREliC
 from pathlib import Path
 from PIL import Image
 from sar_evaluation_metrics import *
-# from torchmetrics.functional import structural_similarity_index_measure as SSIM
-# from torchmetrics.functional import peak_signal_noise_ratio as PSNR
-# from torchmetrics import MeanSquaredError as mse
+from torchmetrics.functional import structural_similarity_index_measure as SSIM
+from torchmetrics.functional import peak_signal_noise_ratio as PSNR
+from torchmetrics import MeanSquaredError as mse
 from torchvision import transforms
 from typing import List
 
@@ -75,8 +75,8 @@ def main():
                 image_dct = dct.dct_2d(gt_sar)
                 # avg_time = 0
                 # for i in range(10):
-                #     #start     = time.time()
-                #     out_enc   = model.compress(image_dct)
+                #     #start = time.time()
+                #     out_enc = model.compress(image_dct)
                 #     #avg_time += time.time() - start
                 #     avg_time += out_enc['time']['y_enc'] + out_enc['time']['z_enc'] + out_enc['time']['z_dec'] + out_enc['time']['params']
                 # print("Avg encode time: %.4f"%(avg_time/10))
@@ -107,7 +107,7 @@ def main():
                 # Recompute PSNR and SSIM by unscaling the image, then finding amplitude image, and compare directly            
                 max_val   = 5000
                 min_val   = -5000
-                amp_max_val  = torch.sqrt(torch.tensor(max_val ** 2 + min_val ** 2))
+                amp_max_val = torch.sqrt(torch.tensor(max_val ** 2 + min_val ** 2))
                 pred_sar_img = out_dec['x_hat'].detach().cpu()
 
                 # pred_sar_img range [0,1] undo the normalization

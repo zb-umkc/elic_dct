@@ -1,37 +1,24 @@
 import compressai
-import csv
 import glob
-import math
-import matplotlib.pyplot as plt
 import numpy as np
-import os
 import pickle
 import sarpy.io.general.nitf as nitf
-import sys
 import time
 import torch
 import torch.nn as nn
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
 import torch.nn.functional as F
-import torchvision
-
+import matplotlib.pyplot as plt
+import os
 
 from compressai.zoo import load_state_dict
 from dct_fast import ImageDCT
-#from ELICUtilis.datasets import SarIQDataset
 from option import args
 from ELICUtilis.models.NetworkDCT_v2 import SAREliC
 from pathlib import Path
-from PIL import Image
 from sar_evaluation_metrics import *
-from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-# from torchmetrics.functional import structural_similarity_index_measure as SSIM
-# from torchmetrics.functional import peak_signal_noise_ratio as PSNR
-# from torchmetrics import MeanSquaredError as mse
-# from torchvision import transforms
-# from typing import List
 
 block_size = 4
 dct = ImageDCT(block_size)
@@ -124,20 +111,29 @@ def decompress():
         f_size_sarelic = Path(bitstream_path)
         bpp = f_size_sarelic.stat().st_size * 8.0 / (pred_sar_img.size(0) * pred_sar_img.size(1) * pred_sar_img.size(2) * pred_sar_img.size(3))
 
-        # load dataset
-        test_dataset = SarIQDataset(args.test_image, args)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+        if args.test_image is not None:
+            # load dataset
+            test_dataset = SarIQDataset(args.test_image, args)
+            test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-        # Compare with the GT IQ data, make sure to undo the normalization
-        data         = next(iter(test_loader))
-        gt_sar       = data['gt_pol']#.to(device)
-        gt_sar       = gt_sar * (max_val - min_val) + min_val
-        GT_amp_img   = torch.sqrt(gt_sar[0,0,:,:]**2 + gt_sar[0,1,:,:]**2)
-        GT_phase     = torch.atan2(gt_sar[0,1,:,:], gt_sar[0,0,:,:])
+            # Compare with the GT IQ data, make sure to undo the normalization
+            data         = next(iter(test_loader))
+            gt_sar       = data['gt_pol']#.to(device)
+            gt_sar       = gt_sar * (max_val - min_val) + min_val
+            GT_amp_img   = torch.sqrt(gt_sar[0,0,:,:]**2 + gt_sar[0,1,:,:]**2)
+            GT_phase     = torch.atan2(gt_sar[0,1,:,:], gt_sar[0,0,:,:])
 
-        rmse, psnr_val, msssim, sqnr, relative_error = amplitude_error((GT_amp_img/amp_max_val).unsqueeze(0).unsqueeze(0).cuda(), (pred_amp/amp_max_val).unsqueeze(0).unsqueeze(0).cuda(), 5)
-        mape         = phase_error(predicted_phase, GT_phase)
-        print("Bitrate: %.4f bpp (%d Bytes)\nDecode Time: %.4f\nPSNR: %.4f\nMSSSIM: %.4f\nSQNR: %.4f\nRelative Error: %.4f\nMAPE: %.4f"%(bpp, f_size_sarelic.stat().st_size, dec_time, psnr_val, msssim, sqnr, relative_error, mape))                
+            plt.imsave(os.path.join(args.save_encoded, "GT_amp.png"), GT_amp_img.cpu().numpy(), cmap='gray')
+            plt.imsave(os.path.join(args.save_encoded, "pred_amp.png"), pred_amp.cpu().numpy(), cmap='gray')
+            header_file = os.path.join(args.save_encoded, os.path.splitext(os.path.basename(bitstream_path))[0] + '_header.txt')
+            metadata_file = os.path.join(args.save_encoded, os.path.splitext(os.path.basename(bitstream_path))[0] + '_metadata.txt')
+            with open(header_file, 'wb') as file_header:
+                file_header.write(sar_header[0])
+            with open(metadata_file, 'wb') as file_metadata:
+                file_metadata.write(sar_metadata[0])
+            rmse, psnr_val, msssim, sqnr, relative_error = amplitude_error((GT_amp_img/amp_max_val).unsqueeze(0).unsqueeze(0).to(device), (pred_amp/amp_max_val).unsqueeze(0).unsqueeze(0).to(device), 5, device)
+            mape         = phase_error(predicted_phase, GT_phase)
+            print("Bitrate: %.4f bpp (%d Bytes)\nDecode Time: %.4f\nPSNR: %.4f\nMSSSIM: %.4f\nSQNR: %.4f\nRelative Error: %.4f\nMAPE: %.4f"%(bpp, f_size_sarelic.stat().st_size, dec_time, psnr_val, msssim, sqnr, relative_error, mape))                
 
 if __name__ == '__main__':
     decompress()

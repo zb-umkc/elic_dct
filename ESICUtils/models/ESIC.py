@@ -6,20 +6,23 @@ import time
 
 import torch
 import torch.nn as nn
-from torch import Tensor
+import torchvision.ops
 from timm.models.layers import trunc_normal_
-from ELICUtilis.layers import (
+import sys
+sys.path.append("/media/paras/WD_BLACK/ood/PythonDir/SAREliC-Compression-master/")
+from ESICUtils.layers import (
     AttentionBlock,
     conv3x3,
     CheckerboardMaskedConv2d, conv1x1
 )
 
 from compressai.models.google import CompressionModel, GaussianConditional
-from compressai.ops import quantize_ste as ste_round
 from compressai.models.utils import conv, deconv, update_registered_buffers
-
-from thop import profile
+from compressai.ops import quantize_ste as ste_round
 from ptflops import get_model_complexity_info
+from thop import profile
+from torch import Tensor
+
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -28,7 +31,67 @@ SCALES_LEVELS = 64
 def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
     return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
 
+class DeformableConv2d(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=3,
+                 stride=1,
+                 padding=1,
+                 bias=False):
 
+        super(DeformableConv2d, self).__init__()
+        
+        assert type(kernel_size) == tuple or type(kernel_size) == int
+
+        kernel_size = kernel_size if type(kernel_size) == tuple else (kernel_size, kernel_size)
+        self.stride = stride if type(stride) == tuple else (stride, stride)
+        self.padding = padding
+        
+        self.offset_conv = nn.Conv2d(in_channels, 
+                                     2 * kernel_size[0] * kernel_size[1],
+                                     kernel_size=kernel_size, 
+                                     stride=stride,
+                                     padding=self.padding, 
+                                     bias=True)
+
+        nn.init.constant_(self.offset_conv.weight, 0.)
+        nn.init.constant_(self.offset_conv.bias, 0.)
+        
+        self.modulator_conv = nn.Conv2d(in_channels, 
+                                     1 * kernel_size[0] * kernel_size[1],
+                                     kernel_size=kernel_size, 
+                                     stride=stride,
+                                     padding=self.padding, 
+                                     bias=True)
+
+        nn.init.constant_(self.modulator_conv.weight, 0.)
+        nn.init.constant_(self.modulator_conv.bias, 0.)
+        
+        self.regular_conv = nn.Conv2d(in_channels=in_channels,
+                                      out_channels=out_channels,
+                                      kernel_size=kernel_size,
+                                      stride=stride,
+                                      padding=self.padding,
+                                      bias=bias)
+
+    def forward(self, x):
+        #h, w = x.shape[2:]
+        #max_offset = max(h, w)/4.
+
+        offset = self.offset_conv(x)#.clamp(-max_offset, max_offset)
+        modulator = 2. * torch.sigmoid(self.modulator_conv(x))
+        
+        x = torchvision.ops.deform_conv2d(input=x, 
+                                          offset=offset, 
+                                          weight=self.regular_conv.weight, 
+                                          bias=self.regular_conv.bias, 
+                                          padding=self.padding,
+                                          mask=modulator,
+                                          stride=self.stride,
+                                          )
+        return x
+    
 class ResidualBottleneckBlock(nn.Module):
     """Simple residual block with two 3x3 convolutions.
 
@@ -70,7 +133,7 @@ class Quantizer():
         else:
             return torch.round(inputs)
 
-class SAREliC(CompressionModel):
+class ESIC(CompressionModel):
     def __init__(
         self,
         N=192,
@@ -243,8 +306,10 @@ class SAREliC(CompressionModel):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, mode_quant="ste"):
+    def forward(self, x, gp=None, mode_quant="ste"):
         y = self.g_a(x)
+        if gp:
+            y = y[:,gp,:,:]
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
 
@@ -259,10 +324,10 @@ class SAREliC(CompressionModel):
         non_anchor = torch.zeros_like(y)
         self._copy(anchor, y, "anchor")
         self._copy(non_anchor, y, "non_anchor")
-        anchor_split = torch.split(anchor, self.groups[1:], dim=1)
-        non_anchor_split = torch.split(non_anchor, self.groups[1:], dim=1)
+        anchor_split = torch.split(anchor, self.groups[1:], dim=1)#tuple(anchor[:, indices, :, :] for indices in gp.values())#torch.split(anchor, self.groups[1:], dim=1)
+        non_anchor_split = torch.split(non_anchor, self.groups[1:], dim=1)#tuple(non_anchor[:, indices, :, :] for indices in gp.values())#torch.split(non_anchor, self.groups[1:], dim=1)
 
-        y_slices = torch.split(y, self.groups[1:], dim=1)
+        y_slices = torch.split(y, self.groups[1:], dim=1)#tuple(y[:, indices, :, :] for indices in gp.values())#torch.split(y, self.groups[1:], dim=1)
 
         y_likelihood = []
         y_hat_slices = []
@@ -291,6 +356,7 @@ class SAREliC(CompressionModel):
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "y": y,
         }
 
     def load_state_dict(self, state_dict):
@@ -316,9 +382,11 @@ class SAREliC(CompressionModel):
         updated |= super().update(force=force)
         return updated
 
-    def compress(self, x):
+    def compress(self, x, gp=None):
         y_enc_start = time.time()
         y = self.g_a(x)
+        if gp:
+            y = y[:,gp,:,:]
         y_enc = time.time() - y_enc_start
         #var_latent = torch.var(y, dim=(2,3))
         #val, idx = torch.sort(var_latent, descending=True)
@@ -332,7 +400,7 @@ class SAREliC(CompressionModel):
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
         z_dec = time.time() - z_dec_start
 
-        y_slices = torch.split(y, self.groups[1:], dim=1)
+        y_slices =  torch.split(y, self.groups[1:], dim=1)#tuple(y[:, indices, :, :] for indices in gp.values())#torch.split(y, self.groups[1:], dim=1)
 
         y_strings = []
         y_hat_slices = []
@@ -672,8 +740,8 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
 
-    from ELICUtilis.datasets.utils import SarIQDataset
-    from option_NGA import args
+    from ESICUtils.datasets.utils import SarIQDataset
+    from option import args
     from torch.utils.data import DataLoader
     from dct_fast import ImageDCT
     
@@ -681,19 +749,20 @@ if __name__ == "__main__":
     block_size = 4
     dct = ImageDCT(block_size)
 
-    dataset = SarIQDataset(os.path.join('/home/pmc4p/', args.validation_dataset), train=False, data_type=args.datatype, min_val=args.min_val, max_val=args.max_val)
+    dataset = SarIQDataset(args.validation_dataset, train=False, min_val=args.min_val, max_val=args.max_val)
     loader  = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1)
-    img = next(iter(loader)).cuda()
+    data = next(iter(loader))
+    img = data['gt_pol'].cuda()
 
     img = dct.dct_2d(img)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     compressai.set_entropy_coder(args.entropy_coder)
     #data       = torch.load(args.test_model)
     #state_dict = load_state_dict(data['state_dict'])
-    model_cls  = SAREliC(N=args.N, M=args.M, input_channels=args.inputchannels).to(device)
+    model_cls  = ESIC(N=args.N, M=args.M, input_channels=args.inputchannels).to(device)
     #model_cls.load_state_dict(state_dict)
     model      = model_cls.eval()
-    #model = SAREliC(N=192, M=320, input_channels=args.inputchannels).cuda()
+    #model = ESIC(N=192, M=320, input_channels=args.inputchannels).cuda()
 
     flops, params = get_model_complexity_info(model, (32, 64, 64), as_strings=True, print_per_layer_stat=True)
     print('flops: ', flops, 'params: ', params)

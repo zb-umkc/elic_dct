@@ -11,28 +11,28 @@ ms_ssim_amp_module = MS_SSIM(data_range=1.0, size_average=True, channel=1)
 def phase_error(phase1, phase2):
     return torch.mean(torch.abs(phase1 - phase2))
 
-def compute_SQNR_vectorized(signal, quantized_signal,neighborhood_size=5):
+def compute_SQNR_vectorized(signal, quantized_signal,neighborhood_size=5, device=torch.device("cpu")):
     # signal = torch.tensor(signal, dtype=torch.float32)
     # quantized_signal = torch.tensor(quantized_signal, dtype=torch.float32)
     #half_size = neighborhood_size // 2
 
     # Compute local signal power using convolution
     local_signal_power = torch.nn.functional.conv2d(signal**2, 
-                                                    torch.ones(1, 1, neighborhood_size, neighborhood_size).cuda())
+                                                    torch.ones(1, 1, neighborhood_size, neighborhood_size).to(device))
 
     # Compute quantization noise power
     noise = signal - quantized_signal
     local_quantization_noise_power = torch.nn.functional.conv2d(noise**2, 
-                                                                torch.ones(1, 1, neighborhood_size, neighborhood_size).cuda())
+                                                                torch.ones(1, 1, neighborhood_size, neighborhood_size).to(device))
     relative_error = torch.mean(local_quantization_noise_power/local_signal_power)
     sqnr = torch.mean(10*torch.log10(local_signal_power/neighborhood_size**2) - 10*torch.log10(local_quantization_noise_power/neighborhood_size**2))
     #sqnr = torch.mean((local_signal_power) / (local_quantization_noise_power))
     
     return sqnr, relative_error
 
-def amplitude_error(target, pred, neighborhood_size):
+def amplitude_error(target, pred, neighborhood_size, device=torch.device('cpu')):
     pred = torch.clamp(pred, 0, 1)
-    sqnr, relative_error = compute_SQNR_vectorized(target, pred, neighborhood_size)
+    sqnr, relative_error = compute_SQNR_vectorized(target, pred, neighborhood_size, device=device)
     mse = mse_loss(target, pred)
     rmse = torch.sqrt(mse)
     psnr = 10*np.log10(1/mse.item())

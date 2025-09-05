@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from timm.models.layers import trunc_normal_
+import sys
+sys.path.append("/home/pmc4p/PythonDir/SAREliC-Compression-master/")
 from ELICUtilis.layers import (
     AttentionBlock,
     conv3x3,
@@ -315,10 +317,15 @@ class SAREliC(CompressionModel):
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
         return updated
+    
+    def latent(self, x):
+        y = self.g_a(x)
+        return y
 
     def compress(self, x):
         y_enc_start = time.time()
         y = self.g_a(x)
+        #import pdb; pdb.set_trace()
         y_enc = time.time() - y_enc_start
         #var_latent = torch.var(y, dim=(2,3))
         #val, idx = torch.sort(var_latent, descending=True)
@@ -394,11 +401,11 @@ class SAREliC(CompressionModel):
 
         y_hat = torch.cat(y_hat_slices, dim=1)
 
-        y_dec_start = time.time()
+        #y_dec_start = time.time()
         x_hat = self.g_s(y_hat).clamp_(0, 1)
-        y_dec = time.time() - y_dec_start
+        #y_dec = time.time() - y_dec_start
 
-        return {"x_hat": x_hat, "time": {"y_dec": y_dec}}
+        return {"x_hat": x_hat}#, "time": {"y_dec": y_dec}}
 
     def inference(self, x, mode_quant="ste"):
         y_enc_start = time.time()
@@ -673,7 +680,7 @@ if __name__ == "__main__":
     import os
 
     from ELICUtilis.datasets.utils import SarIQDataset
-    from option_NGA import args
+    from option_NGA_DCTv2 import args
     from torch.utils.data import DataLoader
     from dct_fast import ImageDCT
     
@@ -681,11 +688,11 @@ if __name__ == "__main__":
     block_size = 4
     dct = ImageDCT(block_size)
 
-    dataset = SarIQDataset(os.path.join('/home/pmc4p/', args.validation_dataset), train=False, data_type=args.datatype, min_val=args.min_val, max_val=args.max_val)
-    loader  = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1)
-    img = next(iter(loader)).cuda()
+    # dataset = SarIQDataset(os.path.join('/home/pmc4p/', args.validation_dataset), train=False, data_type=args.datatype, min_val=args.min_val, max_val=args.max_val)
+    # loader  = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1)
+    # img = next(iter(loader)).cuda()
 
-    img = dct.dct_2d(img)
+    # img = dct.dct_2d(img)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     compressai.set_entropy_coder(args.entropy_coder)
     #data       = torch.load(args.test_model)
@@ -708,3 +715,57 @@ if __name__ == "__main__":
     #     out = model.compress(img)
     #     avg_time += out["time"]["y_enc"] + out["time"]["y_dec"] + out["time"]["z_enc"] + out["time"]["z_dec"] + out["time"]["params"]
     # print("Time: ", avg_time / 10)
+
+    '''
+import matplotlib.pyplot as plt
+
+energy_0 = torch.var(y_slices[0], dim=[2,3])
+energy_mean_0 = torch.mean(energy_0, dim=0)
+plt.figure()
+plt.plot(energy_mean_0.data.cpu())
+plt.ylim(0, 20)
+plt.xlabel("index")
+plt.ylabel("Energy")
+plt.title("Group 1")
+plt.grid()
+
+energy_1 = torch.var(y_slices[1], dim=[2,3])
+energy_mean_1 = torch.mean(energy_1, dim=0)
+plt.figure()
+plt.plot(energy_mean_1.data.cpu())
+plt.ylim(0, 20)
+plt.xlabel("index")
+plt.ylabel("Energy")
+plt.title("Group 2")
+plt.grid()
+
+energy_2 = torch.var(y_slices[2], dim=[2,3])
+energy_mean_2 = torch.mean(energy_2, dim=0)
+plt.figure()
+plt.plot(energy_mean_2.data.cpu())
+plt.ylim(0, 20)
+plt.xlabel("index")
+plt.ylabel("Energy")
+plt.title("Group 3")
+plt.grid()
+
+energy_3 = torch.var(y_slices[3], dim=[2,3])
+energy_mean_3 = torch.mean(energy_3, dim=0)
+plt.figure()
+plt.plot(energy_mean_3.data.cpu())
+plt.ylim(0, 20)
+plt.xlabel("index")
+plt.ylabel("Energy")
+plt.title("Group 4")
+plt.grid()
+
+energy_4 = torch.var(y_slices[4], dim=[2,3])
+energy_mean_4 = torch.mean(energy_4, dim=0)
+plt.figure()
+plt.plot(energy_mean_4.data.cpu())
+plt.ylim(0, 20)
+plt.xlabel("index")
+plt.ylabel("Energy")
+plt.title("Group 5")
+plt.grid()
+'''

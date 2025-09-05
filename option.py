@@ -3,22 +3,34 @@ import compressai
 import os
 import time
 
-home_path = os.getenv("HOME")
+home_root = os.getenv("HOME")
 
-# Training settings
-parser = argparse.ArgumentParser(description="SAREliC compression")
-parser.add_argument("--mode", type=str, default="test",
+parser = argparse.ArgumentParser(description="SAR Image Compression (SIC)")
+# General settings
+parser.add_argument("--mode", type=str, default="train",
                     help="train or test (default: %(default)s)")
+parser.add_argument("--lambda", dest="lmbda", type=float, default=4.0, 
+                    help="Lagrangian multiplier for rate-distortion optimization")
 parser.add_argument("--primary_pol", type=str, default='HH',
                     help="Primary polarization to use `VV` or `HH` or `VH` or `HV` (default: %(default)s)")
-parser.add_argument("--test_image", type=str, default='/media/paras/WD_BLACK/PythonDir/dataset/SAR_dataset/NGA/raw/sicd_example_2_PFA_RE32F_IM32F_HH.nitf', #validation_NGA_multi_pol_ps256', #  
-                    help="Test image path (.nift)")
-parser.add_argument("--save_encoded", default="/media/paras/WD_BLACK/PythonDir/SAREliC-Compression/encodedbinaries/",
-                    help="save the encoded files, path to the directory or None to not save data")
-parser.add_argument("--test_model", type=str, default="/media/paras/WD_BLACK/PythonDir/SAREliC-Compression/checkpoint-NGA-DCTv2/checkpoint_best_lambda4.pth.tar",
-                    help="checkpoint path during testing")
 parser.add_argument("--dataset", type=str, default='NGA', 
                     help='Dataloader to use `NGA`or `Sandia` or `JPL` % (default: %(default)s)')
+parser.add_argument("--cuda", action="store_true", default=True,
+                    help="Use cuda")
+parser.add_argument("--save", action="store_true", default=True, 
+                    help="Save model to disk")
+parser.add_argument("--seed", type=float, default=1926, 
+                    help="Set random seed for reproducibility")
+parser.add_argument('--gpu_id', type=str, default='0',
+                    help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument("-c", "--entropy_coder", choices=compressai.available_entropy_coders(), default=compressai.available_entropy_coders()[0],
+                    help="entropy coder (default: %(default)s)") # currently only ans supported in compressAI
+parser.add_argument("--data_root", default="/media/paras/WD_BLACK/ood",
+                    help="directory for dataset")
+parser.add_argument("--datatype", type=str, default='IQ', 
+                    help='ONLY if using `SAR_amp` datasetType. -> Data type to use `amp` (for amplitude) or `I` (for inphase) or `Q` (for quadrature) or `IQ` (for both)')
+
+# Model settings
 parser.add_argument("--inputchannels", default=2, type=int, 
                     help="Number of input channels (default: %(default)s)")
 parser.add_argument("--min_val", type=float, default=-5000, 
@@ -29,21 +41,76 @@ parser.add_argument("--N", type=int, default=192,
                     help="Number of channels of main codec (default: %(default)s)")
 parser.add_argument("--M", type=int, default=320,
                     help="Number of channels of latent codec (default: %(default)s)")
-parser.add_argument("-n", "--num-workers", type=int, default=8,
+parser.add_argument("-n", "--num_workers", type=int, default=8,
                     help="Dataloaders threads (default: %(default)s)")
-parser.add_argument("--patch_size", type=int, nargs=2, default=(1024, 1024),
+parser.add_argument("--patch_size", type=int, nargs=2, default=(256, 256),
                     help="Size of the patches to be cropped (default: %(default)s)")
-parser.add_argument("--cuda", action="store_true", default=False,
-                    help="Use cuda")
-parser.add_argument("--save", action="store_true", default=True, 
-                    help="Save model to disk")
-parser.add_argument("--seed", type=float, default=1926, 
-                    help="Set random seed for reproducibility")
-parser.add_argument('--gpu_id', type=str, default='0',
-                    help='id(s) for CUDA_VISIBLE_DEVICES')
-parser.add_argument("-c", "--entropy-coder", choices=compressai.available_entropy_coders(), default=compressai.available_entropy_coders()[0],
-    help="entropy coder (default: %(default)s)", # currently only ans supported in compressAI
-)
+
+
+# Train settings
+parser.add_argument("--loss", type=int, default=1,
+                    help = "1: MSE, 2: L1, 3: I/Q loss, 4: NMSE loss, 5: Corr Loss (default: %(default)s)")
+parser.add_argument("--train_dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol_/train_NGA_multi_pol_ps256', 
+                    help="Training dataset path")
+parser.add_argument("--validation_dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol_/validation_NGA_multi_pol_ps256', 
+                    help="Validation dataset path")
+parser.add_argument("--test_dataset", type=str, default='PythonDir/dataset/SAR_dataset/NGA/multi_pol_/test_NGA_multi_pol_ps1024', #
+                    help="Test dataset path")
+parser.add_argument('--checkpoint', type=str, default='PythonDir/SAREliC-Compression-master/checkpoint_',
+                    help='Path to save the checkpoint, use different path for different experiments')
+parser.add_argument("--pretrain", type=str, default=None, 
+                    help="Path to a pretrain")
+parser.add_argument("-e", "--epochs", type=int, default=250,
+                    help="Number of epochs (default: %(default)s)")
+parser.add_argument("--finetune_epoch", type=int, default=175,
+                    help="Epoch to start finetuning or applying STE normalization (default: %(default)s)")
+parser.add_argument("-lr", "--learning_rate", type=float, default=1e-4,
+                    help="Learning rate (default: %(default)s)")
+parser.add_argument("--min_lr", default=0.0, type=float, 
+                    help="Minimum learning rate for cosine annealing scheduler (default: %(default)s)") 
+parser.add_argument("--aux_learning_rate", type=float, default=1e-3,
+                    help="Auxiliary loss learning rate (default: %(default)s)")
+parser.add_argument("--batch_size", type=int, default=16, 
+                    help="Batch size (default: %(default)s)")
+parser.add_argument("--test_batch_size", type=int, default=32,
+                    help="Test batch size (default: %(default)s)")
+parser.add_argument("--clip_max_norm", type=float, default=1.0, 
+                    help="gradient clipping max norm (default: %(default)s)")
+
+# Test settings
+parser.add_argument("--test_image", type=str, default='/home/pmc4p/PythonDir/dataset/SAR_dataset/NGA/raw/sicd_example_2_PFA_RE32F_IM32F_HH.nitf', #validation_NGA_multi_pol_ps256', #  
+                    help="Test image path (.nift)")
+parser.add_argument("--save_encoded", default="/home/pmc4p/PythonDir/SAREliC-Compression-master/encodedbinaries/example2",
+                    help="save the encoded files, path to the directory or None to not save data")
+parser.add_argument("--test_model", type=str, default="/home/pmc4p/PythonDir/SAREliC-Compression-master/checkpoint-NGA-E2E-DCT/checkpoint_best_lambda4.pth.tar",
+                    help="checkpoint path during testing")
 
 args = parser.parse_args()
-assert os.path.exists(args.test_image), "test image path not found"
+
+if args.data_root == None:
+    args.data_root = home_root
+args.home_root = home_root
+
+if args.mode == "train":
+    args.train_dataset = os.path.join(args.data_root, args.train_dataset)
+    assert os.path.exists(args.train_dataset), "Training dataset path not found"
+    args.validation_dataset = os.path.join(args.data_root, args.validation_dataset)
+    assert os.path.exists(args.validation_dataset), "Validation dataset path not found"
+    args.checkpoint = os.path.join(args.data_root, args.checkpoint)
+    args.checkpoint = os.path.join(args.checkpoint, "%s_%s_DCTv2_p%db%d_N%dM%d_loss%d_lmbda%.2f"%(args.dataset, args.datatype, args.patch_size[0], args.batch_size, args.N, args.M, args.loss, args.lmbda))
+    if os.path.exists(args.checkpoint):
+        print("Checkpoint path already exists")
+        args.checkpoint = os.path.join(args.checkpoint, time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(args.checkpoint, exist_ok=True)
+    if args.pretrain is not None:
+        args.pretrain = os.path.join(args.data_root, args.pretrain)
+        assert os.path.exists(args.pretrain), "Pretrain path not found"
+    # save hyperparameters to same location as the model
+    print("\n", "*"*100, "\n")
+    with open(os.path.join(args.checkpoint, "hyperparameters.txt"), "w") as f:
+        for key, value in args._get_kwargs():
+            f.write(f"{key}: {value}\n")
+            print(f"{key}: {value}\n")
+else:
+    args.patch_size = (1024, 1024)
+    assert os.path.exists(args.test_image), "test image path not found"
