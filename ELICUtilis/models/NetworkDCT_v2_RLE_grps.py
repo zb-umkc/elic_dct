@@ -318,32 +318,54 @@ class SAREliC(CompressionModel):
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
         return updated
+    
+    def str_to_bytes(self, bitstring: str) -> bytes:
+        # Pad to a multiple of 8 so int() works
+        padding = (8 - len(bitstring) % 8) % 8
+        bitstring_padded = bitstring + "0" * padding
+        return int(bitstring_padded, 2).to_bytes(len(bitstring_padded) // 8, "big"), padding
 
-    def compress(self, x, bypass):
+    def bytes_to_str(self, b: bytes, padding: int) -> str:
+        # Get binary string and trim padding
+        bitstring = bin(int.from_bytes(b, "big"))[2:].zfill(len(b) * 8)
+        return bitstring[:-padding] if padding else bitstring
+
+    def compress(self, x, bypass_grps=[]):
         y_enc_start = time.time()
         y = self.g_a(x)
         y_enc = time.time() - y_enc_start
         #var_latent = torch.var(y, dim=(2,3))
         #val, idx = torch.sort(var_latent, descending=True)
 
-        if not bypass:
-            z_enc_start = time.time()
-            z = self.h_a(y)
-            z_enc = time.time() - z_enc_start
-            z_strings = self.entropy_bottleneck.compress(z)
-            z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        z_enc_start = time.time()
+        z = self.h_a(y)
+        z_enc = time.time() - z_enc_start
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-            z_dec_start = time.time()
-            latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
-            z_dec = time.time() - z_dec_start
+        z_dec_start = time.time()
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        z_dec = time.time() - z_dec_start
 
-            y_slices = torch.split(y, self.groups[1:], dim=1)
+        y_slices = torch.split(y, self.groups[1:], dim=1)
 
-            y_strings = []
-            y_hat_slices = []
-            params_start = time.time()
+        y_strings = []
+        y_hat_slices = []
+        headers = {}
+        slice_times = {}
+        params_start = time.time()
 
-            for slice_index, y_slice in enumerate(y_slices):
+        for slice_index, y_slice in enumerate(y_slices):
+            slice_start = time.time()
+            if slice_index in bypass_grps:
+                y_strings_i, y_hat_i, header = self._rle_bypass_encode(y_slice)
+                headers[slice_index] = header
+                y_strings_i, padding = self.str_to_bytes(y_strings_i)
+
+                y_hat_slices.append(y_hat_i)
+                y_strings.append((y_strings_i, padding))
+
+            else:
                 support = self._calculate_support(
                     slice_index, y_hat_slices, latent_means, latent_scales
                 )
@@ -359,72 +381,54 @@ class SAREliC(CompressionModel):
                 y_hat_slices.append(y_hat_i)
                 y_strings.append(y_strings_i)
 
-            params_time = time.time() - params_start
+            slice_times[slice_index] = time.time() - slice_start
 
-            strings = [y_strings, z_strings]
+        params_time = time.time() - params_start
 
-            y_hat = torch.cat(y_hat_slices, dim=1).cpu().numpy()
+        strings = [y_strings, z_strings]
 
-            out_enc = {
-                "strings": strings,
-                "shape": z.size()[-2:],
-                "y_hat": y_hat,
-                "time": {
-                    "y_enc": y_enc,
-                    "z_enc": z_enc,
-                    "z_dec": z_dec,
-                    "params": params_time,
-                },
-            }
+        y_hat = torch.cat(y_hat_slices, dim=1).squeeze(0).cpu().numpy()
+        z_hat = z_hat.squeeze(0).cpu().numpy()
 
-        else:
-            y_shape = y.shape
-            y_hat = torch.flatten(y).round().int().cpu().numpy()
+        out_enc = {
+            "strings": strings,
+            "shape": z.size()[-2:],
+            "y_hat": y_hat,
+            "z_hat": z_hat,
+            "headers": headers,
+            "time": {
+                "y_enc": y_enc,
+                "z_enc": z_enc,
+                "z_dec": z_dec,
+                "params": params_time,
+                "slices": slice_times,
+            },
+        }
 
-            rle_start = time.time()
-            vals, lens = rle_encode_v1(y_hat)
-            rle_time = time.time() - rle_start
-
-            eg1_start = time.time()
-            vals_encoded = exp_golomb_encode_lookup(vals)
-            eg1_time = time.time() - eg1_start
-
-            eg2_start = time.time()
-            lens_encoded = exp_golomb_encode_unsigned_lookup(lens)
-            eg2_time = time.time() - eg2_start
-
-            # Just passing the widths directly for now
-            # Should ultimately be a header or interleaved bitstream
-            vals_len = len(vals_encoded)
-            lens_len = len(lens_encoded)
-            y_strings = vals_encoded + lens_encoded
-
-            out_enc = {
-                "strings": y_strings,
-                "y_hat": y_hat,
-                "y_shape": y_shape,
-                "vals_len": vals_len,
-                "lens_len": lens_len,
-                "time": {
-                    "y_enc": y_enc,
-                    "rle": rle_time,
-                    "eg1": eg1_time,
-                    "eg2": eg2_time,
-                },
-            }
 
         return out_enc
 
-    def decompress(self, strings, shape, bypass, out_enc, **kwargs):
-        if not bypass:
-            assert isinstance(strings, list) and len(strings) == 2
-            [y_strings, z_strings] = strings
+    def decompress(self, strings, shape, bypass_grps, out_enc, **kwargs):
+        assert isinstance(strings, list) and len(strings) == 2
+        [y_strings, z_strings] = strings
 
-            z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
-            latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
-            y_hat_slices = []
+        z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
+        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+        y_hat_slices = []
+        slice_times = {}
 
-            for slice_index in range(len(self.groups) - 1):
+        for slice_index in range(len(self.groups) - 1):
+            slice_start = time.time()
+            if slice_index in bypass_grps:
+                y_strings_i, padding = y_strings[slice_index]
+                y_strings_i = self.bytes_to_str(y_strings_i, padding)
+                y_hat_i = self._rle_bypass_decode(
+                    y_strings=y_strings_i,
+                    header=out_enc['headers'][slice_index]
+                )
+                y_hat_slices.append(y_hat_i)
+
+            else:
                 support = self._calculate_support(
                     slice_index, y_hat_slices, latent_means, latent_scales
                 )
@@ -439,50 +443,22 @@ class SAREliC(CompressionModel):
 
                 y_hat_slices.append(y_hat_i)
 
-            y_hat = torch.cat(y_hat_slices, dim=1)
+            slice_times[slice_index] = time.time() - slice_start
 
-            out_dec = {
-                "y_hat": y_hat,
-                "time": {
-                }
-            }
-
-        else:
-            y_shape = out_enc['y_shape']
-            vals_len = out_enc['vals_len']
-            lens_len = out_enc['lens_len']
-            vals_encoded = strings[:vals_len]
-            lens_encoded = strings[vals_len:(vals_len + lens_len)]
-
-            eg1_start = time.time()
-            vals_decoded = exp_golomb_decode_optimized_v1(vals_encoded)
-            eg1_time = time.time() - eg1_start
-
-            eg2_start = time.time()
-            lens_decoded = exp_golomb_decode_unsigned(lens_encoded)
-            eg2_time = time.time() - eg2_start
-
-            rle_start = time.time()
-            arr_decoded = rle_decode(vals_decoded, lens_decoded)
-            rle_time = time.time() - rle_start
-
-            y_hat = torch.from_numpy(arr_decoded.reshape(y_shape)).float().to(next(self.parameters()).device)
-
-            out_dec = {
-                "y_hat": y_hat,
-                "time": {
-                    "eg1": eg1_time,
-                    "eg2": eg2_time,
-                    "rle": rle_time,
-                }
-            }
+        y_hat = torch.cat(y_hat_slices, dim=1)
 
         y_dec_start = time.time()
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         y_dec = time.time() - y_dec_start
 
-        out_dec["x_hat"] = x_hat
-        out_dec["time"]["y_dec"] = y_dec
+        out_dec = {
+            "x_hat": x_hat,
+            "y_hat": y_hat,
+            "time": {
+                "y_dec": y_dec,
+                "slices": slice_times,
+            }
+        }
 
         return out_dec
 
@@ -663,6 +639,63 @@ class SAREliC(CompressionModel):
         y_strings = [anchor_strings, non_anchor_strings]
 
         return y_hat, y_strings
+    
+    def _rle_bypass_encode(self, y):
+        y_shape = y.shape
+        y_hat = torch.flatten(y).round().int().cpu().numpy()
+
+        # rle_start = time.time()
+        vals, lens = rle_encode_v1(y_hat)
+        # rle_time = time.time() - rle_start
+
+        # eg1_start = time.time()
+        vals_encoded = exp_golomb_encode_lookup(vals)
+        # eg1_time = time.time() - eg1_start
+
+        # eg2_start = time.time()
+        lens_encoded = exp_golomb_encode_unsigned_lookup(lens)
+        # eg2_time = time.time() - eg2_start
+
+        # Just passing the widths directly for now
+        # Should ultimately be a header or interleaved bitstream
+        vals_len = len(vals_encoded)
+        lens_len = len(lens_encoded)
+        y_strings = vals_encoded + lens_encoded
+
+        header = {
+            "y_shape": y_shape,
+            "vals_len": vals_len,
+            "lens_len": lens_len
+        }
+
+        # Convert y_hat to tensor
+        y_hat = y_hat.reshape(y_shape)
+        y_hat = torch.from_numpy(y_hat).float().to(next(self.parameters()).device)
+
+        return y_strings, y_hat, header
+
+    def _rle_bypass_decode(self, y_strings, header):
+        y_shape = header['y_shape']
+        vals_len = header['vals_len']
+        lens_len = header['lens_len']
+        vals_encoded = y_strings[:vals_len]
+        lens_encoded = y_strings[vals_len:(vals_len + lens_len)]
+
+        # eg1_start = time.time()
+        vals_decoded = exp_golomb_decode_optimized_v1(vals_encoded)
+        # eg1_time = time.time() - eg1_start
+
+        # eg2_start = time.time()
+        lens_decoded = exp_golomb_decode_unsigned(lens_encoded)
+        # eg2_time = time.time() - eg2_start
+
+        # rle_start = time.time()
+        arr_decoded = rle_decode(vals_decoded, lens_decoded)
+        # rle_time = time.time() - rle_start
+
+        y_hat = torch.from_numpy(arr_decoded.reshape(y_shape)).float().to(next(self.parameters()).device)
+
+        return y_hat
 
     def _checkerboard_codec_step(
         self, y_input, slice_index, support, ctx_params, mode_codec, mode_step

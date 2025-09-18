@@ -1,5 +1,16 @@
-TRAINING
-python3 train_NGA_DCTv2.py --mode train --primary_pol HV --lambda 10 --train-dataset /scratch/zb7df/data/NGA/multi_pol/train --validation-dataset /scratch/zb7df/data/NGA/multi_pol/validation --checkpoint checkpoint-NGA-HV -e 20
+1. Start new session (8 CPU, 1 GPU, 24 hrs)
 
-TESTING
-python3 test_NGA_DCTv2_RLE.py --mode test --primary_pol HH --test-dataset /scratch/zb7df/data/NGA/multi_pol/validation --test-model /scratch/zb7df/data/checkpoint-NGA-DCTv2/checkpoint_best_lambda4.pth.tar
+2. module load gcc/11.2.0-gcc-8.5.0-cuda-11.2.2-yzmk
+
+3. Navigate to elic folder
+ 	-> cd dev/elic_dct
+
+4. conda env create -f environment.yml
+
+5. conda activate elic
+
+6. Training
+    -> python3 train_NGA_DCTv2.py --mode train --primary_pol HV --lambda 10 --train-dataset /scratch/zb7df/data/NGA/multi_pol/train --validation-dataset /scratch/zb7df/data/NGA/multi_pol/validation --checkpoint checkpoint-NGA-HV -e 20
+
+7. Testing
+    -> python3 test_NGA_DCTv2_RLE.py --mode test --primary_pol HH --test-dataset /scratch/zb7df/data/NGA/multi_pol/validation --test-model /scratch/zb7df/data/checkpoint-NGA-DCTv2/checkpoint_best_lambda4.pth.tar

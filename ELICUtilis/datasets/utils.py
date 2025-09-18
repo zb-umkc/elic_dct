@@ -82,8 +82,8 @@ class SarIQDataset(Dataset):
         # shape: W * H * C
         gt_image_pol1     = np.load(os.path.join(self.gt_pol1, input_image_name)).astype(np.float32)
         gt_image_pol2     = np.load(os.path.join(self.gt_pol2, input_image_name)).astype(np.float32)
-        gt_image_pol3     = np.load(os.path.join(self.gt_pol2, input_image_name)).astype(np.float32)
-        gt_image_pol4     = np.load(os.path.join(self.gt_pol2, input_image_name)).astype(np.float32)
+        gt_image_pol3     = np.load(os.path.join(self.gt_pol3, input_image_name)).astype(np.float32)
+        gt_image_pol4     = np.load(os.path.join(self.gt_pol4, input_image_name)).astype(np.float32)
 
         # shape: C * W * H
         gt_image_pol1     = np.stack([gt_image_pol1[:,:,0], gt_image_pol1[:,:,1]], axis=0)

@@ -17,12 +17,12 @@ def compute_SQNR_vectorized(signal, quantized_signal,neighborhood_size=5, device
     #half_size = neighborhood_size // 2
 
     # Compute local signal power using convolution
-    local_signal_power = torch.nn.functional.conv2d(signal**2, 
+    local_signal_power = torch.nn.functional.conv2d((signal**2).to(device), 
                                                     torch.ones(1, 1, neighborhood_size, neighborhood_size).to(device))
 
     # Compute quantization noise power
     noise = signal - quantized_signal
-    local_quantization_noise_power = torch.nn.functional.conv2d(noise**2, 
+    local_quantization_noise_power = torch.nn.functional.conv2d((noise**2).to(device), 
                                                                 torch.ones(1, 1, neighborhood_size, neighborhood_size).to(device))
     relative_error = torch.mean(local_quantization_noise_power/local_signal_power)
     sqnr = torch.mean(10*torch.log10(local_signal_power/neighborhood_size**2) - 10*torch.log10(local_quantization_noise_power/neighborhood_size**2))

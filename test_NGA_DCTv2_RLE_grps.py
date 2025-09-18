@@ -18,14 +18,14 @@ torch.set_num_threads(1)
 import torch.nn.functional as F
 import torchvision
 from tqdm import tqdm
-from bitarray import bitarray
+# from bitarray import bitarray
 import h5py
 
 from compressai.zoo import load_state_dict
 from dct_fast import ImageDCT
 from ELICUtilis.datasets import SarIQDataset
 from option_NGA_DCTv2 import args
-from ELICUtilis.models.NetworkDCT_v2_RLE import SAREliC
+from ELICUtilis.models.NetworkDCT_v2_RLE_grps import SAREliC
 from pathlib import Path
 from PIL import Image
 from sar_evaluation_metrics import *
@@ -57,18 +57,25 @@ def main():
         os.makedirs(args.save_encoded, exist_ok=True)
         model_name = args.test_model.split('/')[-1]
         lmbda = int(''.join(filter(str.isdigit, model_name)))
-        csv_name = f"{args.primary_pol}_bypass_{lmbda}.csv" if args.bypass else f"{args.primary_pol}_baseline_{lmbda}.csv"
+        csv_name = f"{args.primary_pol}_bypass{args.bypass_grps}_{lmbda}.csv"
         csv_path = os.path.join("/scratch/zb7df/data/results/", csv_name)
 
+    if "0" in args.bypass_grps:
+        bypass_grps = []
+    else:
+        bypass_grps = [int(x)-1 for x in args.bypass_grps]
+        assert all(x in [0,1,2,3,4] for x in bypass_grps), "Valid bypass_grps: [0,1,2,3,4,5]"
+
     y_hat = []
+    z_hat = []
     with open(csv_path, 'w',) as file:
         writer = csv.writer(file)
         writer.writerow(["Encoded_file", "bpp", "psnr", 'ssim', 'sqnr','mape_phase', 'enc_time', 'dec_time'])
         
         with torch.no_grad():
             for i, data in tqdm(enumerate(test_loader)):
-                # if i >= 1:
-                #     break
+                if i >= 10:
+                    break
                 im_name      = data['name']
                 data         = data['gt_pol'].to(device)
                 if args.primary_pol == "HH":
@@ -89,45 +96,47 @@ def main():
                 #     #avg_time += time.time() - start
                 #     avg_time += out_enc['time']['y_enc'] + out_enc['time']['z_enc'] + out_enc['time']['z_dec'] + out_enc['time']['params']
                 # print("Avg encode time: %.4f"%(avg_time/10))
-                out_enc = model.compress(image_dct, bypass=args.bypass)
+                out_enc = model.compress(image_dct, bypass_grps=bypass_grps)
                 start_time = time.time()
-                out_enc = model.compress(image_dct, bypass=args.bypass)
+                out_enc = model.compress(image_dct, bypass_grps=bypass_grps)
                 enc_time = time.time() - start_time
 
                 start_time = time.time()
                 encode_path = os.path.join(args.save_encoded, os.path.splitext(im_name[0])[0] + '.bin')
                 # save the encoded files
                 if args.save_encoded is not None:
-                    if not args.bypass:
-                        with open(encode_path, 'wb') as file:
-                            pickle.dump(out_enc['strings'], file)
-                    else:
-                        with open(encode_path, 'wb') as file:
-                            bitarray(out_enc['strings']).tofile(file)
+                    # if not args.bypass:
+                    with open(encode_path, 'wb') as file:
+                        pickle.dump(out_enc['strings'], file)
+                    # else:
+                    #     with open(encode_path, 'wb') as file:
+                    #         bitarray(out_enc['strings']).tofile(file)
                 save_time = time.time() - start_time
                 # load them back and decompress
-                if not args.bypass:
-                    with open(encode_path, 'rb') as file:
-                        strings = pickle.load(file)
-                else:
-                    with open(encode_path, 'rb') as file:
-                        strings_ba = bitarray()
-                        strings_ba.fromfile(file)
-                        strings = strings_ba.to01()
+                # if not args.bypass:
+                with open(encode_path, 'rb') as file:
+                    strings = pickle.load(file)
+                # else:
+                #     with open(encode_path, 'rb') as file:
+                #         strings_ba = bitarray()
+                #         strings_ba.fromfile(file)
+                #         strings = strings_ba.to01()
 
                 start_time = time.time()
                 out_dec = model.decompress(strings, torch.Size([args.patch_size[0]//64, args.patch_size[0]//64]),
-                                                            bypass=args.bypass, out_enc=out_enc)
+                                                            bypass_grps=bypass_grps, out_enc=out_enc)
                 dec_time = time.time() - start_time
 
                 y_hat.append(out_enc["y_hat"])
-                output_file = os.path.join("/scratch/zb7df/data/latents/latent_tensors.h5")
+                z_hat.append(out_enc["z_hat"])
+                output_file = os.path.join("/scratch/zb7df/data/latents/latent_tensors_bypass.h5")
                 with h5py.File(output_file, 'w') as f:
                     f.create_dataset("y_hat", data=y_hat)
+                    f.create_dataset("z_hat", data=z_hat)
 
                 f_size_sarelic = Path(encode_path)
                 bpp = f_size_sarelic.stat().st_size * 8.0 / (gt_sar.size(0) * gt_sar.size(1) * gt_sar.size(2) * gt_sar.size(3))
-                print("Bitrate: %.4f bpp per band\n"%(bpp))
+                # print("Bitrate: %.4f bpp per band\n"%(bpp))
 
                 # Recompute PSNR and SSIM by unscaling the image, then finding amplitude image, and compare directly            
                 max_val   = 5000
@@ -161,7 +170,7 @@ def main():
 
                 mape = phase_error(predicted_phase, GT_phase)
 
-                print(f"Image: {im_name[0]}\nBPP : {bpp:.4f}\nEncoder time: {enc_time:.4f}\nFile save time: {save_time:.4f}\nDecoder time: {dec_time:.4f}\nPSNR: {psnr_val:.4f}\nRMSE: {rmse:.4f}\nSSIM: {msssim:.4f}\nSQNR: {sqnr:.4f}\nRE  : {relative_error:.4f}\nMAPE: {mape:.4f}, {180*mape/math.pi:.4f}, pi/{math.pi/mape:.4f}")
+                # print(f"Image: {im_name[0]}\nBPP : {bpp:.4f}\nEncoder time: {enc_time:.4f}\nFile save time: {save_time:.4f}\nDecoder time: {dec_time:.4f}\nPSNR: {psnr_val:.4f}\nRMSE: {rmse:.4f}\nSSIM: {msssim:.4f}\nSQNR: {sqnr:.4f}\nRE  : {relative_error:.4f}\nMAPE: {mape:.4f}, {180*mape/math.pi:.4f}, pi/{math.pi/mape:.4f}")
                 writer.writerow([im_name[0], bpp, psnr_val, msssim.item(), sqnr.item(), mape.item(), enc_time, dec_time])
 
                 del data, gt_sar, image_dct, out_enc, out_dec

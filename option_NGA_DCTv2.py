@@ -74,6 +74,10 @@ parser.add_argument('--gpu-id', type=str, default='0',
 parser.add_argument("-c", "--entropy-coder", choices=compressai.available_entropy_coders(), default=compressai.available_entropy_coders()[0],
     help="entropy coder (default: %(default)s)", # currently only ans supported in compressAI
 )
+# parser.add_argument("--bypass", action="store_true", default=False,
+#                     help="Bypass rANS and context model using RLE/Exp-Golomb",)
+parser.add_argument('--bypass-grps', type=str, default='0',
+                    help='Channel groups to bypass using RLE/Exp-Golomb, ex. 134')
 
 args = parser.parse_args()
 
@@ -99,5 +103,5 @@ if args.mode == "train":
 else:
     args.test_dataset = os.path.join(home_path, args.test_dataset)
     assert os.path.exists(args.test_dataset), "test dataset path not found"
-    args.patch_size = (1024, 1024)
+    args.patch_size = (256, 256)
     # assert os.path.exists(args.test_model), "Test model path not found"
