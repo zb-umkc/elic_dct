@@ -14,7 +14,7 @@ from ELICUtilis.layers import (
     CheckerboardMaskedConv2d, conv1x1
 )
 from rle import *
-from benchmarking import *
+from ELICUtilis.encoding.benchmarking import *
 from benchmarking_decode import *
 
 from compressai.models.google import CompressionModel, GaussianConditional

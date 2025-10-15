@@ -13,9 +13,7 @@ from ELICUtilis.layers import (
     conv3x3,
     CheckerboardMaskedConv2d, conv1x1
 )
-from rle import *
-from benchmarking import *
-from benchmarking_decode import *
+from ELICUtilis.encoding.rle import *
 
 from compressai.models.google import CompressionModel, GaussianConditional
 from compressai.ops import quantize_ste as ste_round
@@ -325,15 +323,19 @@ class SAREliC(CompressionModel):
         bitstring_padded = bitstring + "0" * padding
         return int(bitstring_padded, 2).to_bytes(len(bitstring_padded) // 8, "big"), padding
 
-    def bytes_to_str(self, b: bytes, padding: int) -> str:
+    def bytes_to_str(self, strings_pad) -> str:
         # Get binary string and trim padding
+        b = strings_pad[0]
+        padding = strings_pad[1]
         bitstring = bin(int.from_bytes(b, "big"))[2:].zfill(len(b) * 8)
         return bitstring[:-padding] if padding else bitstring
 
-    def compress(self, x, bypass_grps=[]):
+    def compress(self, x, bypass_grps=[], vals_codebook=[], lens_codebook=[], vals_min=0):
         y_enc_start = time.time()
         y = self.g_a(x)
         y_enc = time.time() - y_enc_start
+        # print(f"0: {y[:, 0, :, :].min()}")
+        # print(f"1: {y[:, 1, :, :].min()}")
         #var_latent = torch.var(y, dim=(2,3))
         #val, idx = torch.sort(var_latent, descending=True)
 
@@ -349,50 +351,61 @@ class SAREliC(CompressionModel):
 
         y_slices = torch.split(y, self.groups[1:], dim=1)
 
-        y_strings = []
-        y_hat_slices = []
-        headers = {}
-        slice_times = {}
-        params_start = time.time()
+        slice_times = {0: [], 1: [], 2: [], 3: [], 4: []}
+        final_slice_times = {}
+        
+        iterations = 10
+        for it in range(iterations+1):
+            y_strings = []
+            y_hat_slices = []
+            headers = {}
 
-        for slice_index, y_slice in enumerate(y_slices):
-            slice_start = time.time()
-            if slice_index in bypass_grps:
-                y_strings_i, y_hat_i, header = self._rle_bypass_encode(y_slice)
-                headers[slice_index] = header
-                y_strings_i, padding = self.str_to_bytes(y_strings_i)
+            for slice_index, y_slice in enumerate(y_slices):
+                slice_start = time.time()
+                if slice_index in bypass_grps:
+                    y_strings_i, y_hat_i, header = self._rle_bypass_encode(y_slice, vals_codebook, lens_codebook, vals_min)
+                    headers[slice_index] = header
+                    vals_strings_pad = self.str_to_bytes(y_strings_i[0])
+                    lens_strings_pad = self.str_to_bytes(y_strings_i[1])
 
-                y_hat_slices.append(y_hat_i)
-                y_strings.append((y_strings_i, padding))
+                    y_hat_slices.append(y_hat_i)
+                    y_strings.append((vals_strings_pad, lens_strings_pad))
 
-            else:
-                support = self._calculate_support(
-                    slice_index, y_hat_slices, latent_means, latent_scales
-                )
+                else:
+                    support = self._calculate_support(
+                        slice_index, y_hat_slices, latent_means, latent_scales
+                    )
 
-                y_hat_i, y_strings_i = self._checkerboard_codec(
-                    [y_slice.clone(), y_slice.clone()],
-                    slice_index,
-                    support,
-                    y_shape=y.shape[-2:],
-                    mode="compress",
-                )
+                    y_hat_i, y_strings_i = self._checkerboard_codec(
+                        [y_slice.clone(), y_slice.clone()],
+                        slice_index,
+                        support,
+                        y_shape=y.shape[-2:],
+                        mode="compress",
+                    )
 
-                y_hat_slices.append(y_hat_i)
-                y_strings.append(y_strings_i)
+                    y_hat_slices.append(y_hat_i)
+                    y_strings.append(y_strings_i)
 
-            slice_times[slice_index] = time.time() - slice_start
+                # Warmup
+                if it > 0:
+                    slice_times[slice_index].append(time.time() - slice_start)
 
-        params_time = time.time() - params_start
+        for slice_index in slice_times.keys():
+            final_slice_times[slice_index] = {}
+            final_slice_times[slice_index]["mean"] = np.mean(slice_times[slice_index])
+            final_slice_times[slice_index]["std"] = np.std(slice_times[slice_index])
 
         strings = [y_strings, z_strings]
 
+        y = y.cpu().numpy()
         y_hat = torch.cat(y_hat_slices, dim=1).squeeze(0).cpu().numpy()
         z_hat = z_hat.squeeze(0).cpu().numpy()
 
         out_enc = {
             "strings": strings,
             "shape": z.size()[-2:],
+            "y": y,
             "y_hat": y_hat,
             "z_hat": z_hat,
             "headers": headers,
@@ -400,50 +413,66 @@ class SAREliC(CompressionModel):
                 "y_enc": y_enc,
                 "z_enc": z_enc,
                 "z_dec": z_dec,
-                "params": params_time,
-                "slices": slice_times,
+                "slices": final_slice_times,
             },
         }
 
-
         return out_enc
 
-    def decompress(self, strings, shape, bypass_grps, out_enc, **kwargs):
+
+    def decompress(self, strings, shape, bypass_grps, out_enc, vals_codebook=[], lens_codebook=[], vals_min=0):
         assert isinstance(strings, list) and len(strings) == 2
         [y_strings, z_strings] = strings
 
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
-        y_hat_slices = []
-        slice_times = {}
 
-        for slice_index in range(len(self.groups) - 1):
-            slice_start = time.time()
-            if slice_index in bypass_grps:
-                y_strings_i, padding = y_strings[slice_index]
-                y_strings_i = self.bytes_to_str(y_strings_i, padding)
-                y_hat_i = self._rle_bypass_decode(
-                    y_strings=y_strings_i,
-                    header=out_enc['headers'][slice_index]
-                )
-                y_hat_slices.append(y_hat_i)
+        slice_times = {0: [], 1: [], 2: [], 3: [], 4: []}
+        final_slice_times = {}
+        
+        iterations = 10
+        for it in range(iterations+1):
+            y_hat_slices = []
 
-            else:
-                support = self._calculate_support(
-                    slice_index, y_hat_slices, latent_means, latent_scales
-                )
+            for slice_index in range(len(self.groups) - 1):
+                slice_start = time.time()
+                if slice_index in bypass_grps:
+                    vals_strings_pad, lens_strings_pad = y_strings[slice_index]
+                    vals_strings = self.bytes_to_str(vals_strings_pad)
+                    lens_strings = self.bytes_to_str(lens_strings_pad)
+                    y_strings_i = (vals_strings, lens_strings)
+                    y_hat_i = self._rle_bypass_decode(
+                        y_strings=y_strings_i,
+                        header=out_enc['headers'][slice_index],
+                        vals_codebook=vals_codebook,
+                        lens_codebook=lens_codebook,
+                        vals_min=vals_min
+                    )
+                    y_hat_slices.append(y_hat_i)
 
-                y_hat_i, _ = self._checkerboard_codec(
-                    y_strings[slice_index],
-                    slice_index,
-                    support,
-                    y_shape=(shape[0] * 4, shape[1] * 4),
-                    mode="decompress",
-                )
+                else:
+                    support = self._calculate_support(
+                        slice_index, y_hat_slices, latent_means, latent_scales
+                    )
 
-                y_hat_slices.append(y_hat_i)
+                    y_hat_i, _ = self._checkerboard_codec(
+                        y_strings[slice_index],
+                        slice_index,
+                        support,
+                        y_shape=(shape[0] * 4, shape[1] * 4),
+                        mode="decompress",
+                    )
 
-            slice_times[slice_index] = time.time() - slice_start
+                    y_hat_slices.append(y_hat_i)
+
+                # Warmup
+                if it > 0:
+                    slice_times[slice_index].append(time.time() - slice_start)
+
+        for slice_index in slice_times.keys():
+            final_slice_times[slice_index] = {}
+            final_slice_times[slice_index]["mean"] = np.mean(slice_times[slice_index])
+            final_slice_times[slice_index]["std"] = np.std(slice_times[slice_index])
 
         y_hat = torch.cat(y_hat_slices, dim=1)
 
@@ -456,7 +485,7 @@ class SAREliC(CompressionModel):
             "y_hat": y_hat,
             "time": {
                 "y_dec": y_dec,
-                "slices": slice_times,
+                "slices": final_slice_times,
             }
         }
 
@@ -639,33 +668,38 @@ class SAREliC(CompressionModel):
         y_strings = [anchor_strings, non_anchor_strings]
 
         return y_hat, y_strings
-    
-    def _rle_bypass_encode(self, y):
+
+    def _rle_bypass_encode(self, y, vals_codebook, lens_codebook, vals_min):
         y_shape = y.shape
         y_hat = torch.flatten(y).round().int().cpu().numpy()
 
-        # rle_start = time.time()
-        vals, lens = rle_encode_v1(y_hat)
-        # rle_time = time.time() - rle_start
+        vals, lens = rle_encode(y_hat)
+        # vals_min = np.min(vals)
+        vals_adj = vals - vals_min  # Make all values non-negative for encoding
 
-        # eg1_start = time.time()
-        vals_encoded = exp_golomb_encode_lookup(vals)
-        # eg1_time = time.time() - eg1_start
+        # Exponential-Golomb
+        # vals_encoded = exp_golomb_encode_signed(vals)
+        # lens_encoded = exp_golomb_encode_unsigned(lens)
 
-        # eg2_start = time.time()
-        lens_encoded = exp_golomb_encode_unsigned_lookup(lens)
-        # eg2_time = time.time() - eg2_start
+        # Huffman
+        # vals_codebook = build_huffman_codebook(vals_adj)
+        # lens_codebook = build_huffman_codebook(lens)
+        vals_encoded = huffman_encode(vals_adj, vals_codebook)
+        lens_encoded = huffman_encode(lens, lens_codebook)
 
         # Just passing the widths directly for now
         # Should ultimately be a header or interleaved bitstream
-        vals_len = len(vals_encoded)
-        lens_len = len(lens_encoded)
-        y_strings = vals_encoded + lens_encoded
+        # vals_len = len(vals_encoded)
+        # lens_len = len(lens_encoded)
+        y_strings = (vals_encoded, lens_encoded)
 
         header = {
             "y_shape": y_shape,
-            "vals_len": vals_len,
-            "lens_len": lens_len
+            # "vals_len": vals_len,
+            # "lens_len": lens_len,
+            "vals_codebook": vals_codebook,
+            "lens_codebook": lens_codebook,
+            "vals_min": vals_min,
         }
 
         # Convert y_hat to tensor
@@ -674,24 +708,27 @@ class SAREliC(CompressionModel):
 
         return y_strings, y_hat, header
 
-    def _rle_bypass_decode(self, y_strings, header):
+    def _rle_bypass_decode(self, y_strings, header, vals_codebook=[], lens_codebook=[], vals_min=0):
         y_shape = header['y_shape']
-        vals_len = header['vals_len']
-        lens_len = header['lens_len']
-        vals_encoded = y_strings[:vals_len]
-        lens_encoded = y_strings[vals_len:(vals_len + lens_len)]
+        # vals_len = header['vals_len']
+        # lens_len = header['lens_len']
+        # vals_encoded = y_strings[:vals_len]
+        # lens_encoded = y_strings[vals_len:(vals_len + lens_len)]
+        vals_encoded, lens_encoded = y_strings
 
-        # eg1_start = time.time()
-        vals_decoded = exp_golomb_decode_optimized_v1(vals_encoded)
-        # eg1_time = time.time() - eg1_start
+        # Exponential-Golomb
+        # vals_decoded = exp_golomb_decode_signed(vals_encoded)
+        # lens_decoded = exp_golomb_decode_unsigned(lens_encoded)
 
-        # eg2_start = time.time()
-        lens_decoded = exp_golomb_decode_unsigned(lens_encoded)
-        # eg2_time = time.time() - eg2_start
+        # Huffman
+        # vals_codebook = header['vals_codebook']
+        # lens_codebook = header['lens_codebook']
+        vals_decoded = huffman_decode(vals_encoded, vals_codebook)
+        lens_decoded = huffman_decode(lens_encoded, lens_codebook)
 
-        # rle_start = time.time()
+        # vals_min = header['vals_min']
+        vals_decoded = np.array(vals_decoded) + vals_min  # Reverse adjustment
         arr_decoded = rle_decode(vals_decoded, lens_decoded)
-        # rle_time = time.time() - rle_start
 
         y_hat = torch.from_numpy(arr_decoded.reshape(y_shape)).float().to(next(self.parameters()).device)
 
