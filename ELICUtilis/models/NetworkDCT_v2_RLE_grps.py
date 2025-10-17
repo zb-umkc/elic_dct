@@ -354,7 +354,7 @@ class SAREliC(CompressionModel):
         slice_times = {0: [], 1: [], 2: [], 3: [], 4: []}
         final_slice_times = {}
         
-        iterations = 10
+        iterations = 1
         for it in range(iterations+1):
             y_strings = []
             y_hat_slices = []
@@ -430,7 +430,7 @@ class SAREliC(CompressionModel):
         slice_times = {0: [], 1: [], 2: [], 3: [], 4: []}
         final_slice_times = {}
         
-        iterations = 10
+        iterations = 1
         for it in range(iterations+1):
             y_hat_slices = []
 

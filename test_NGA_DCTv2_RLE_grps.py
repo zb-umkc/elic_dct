@@ -104,7 +104,7 @@ def main():
 
     y = []
     y_hat = []
-    z_hat = []
+    # z_hat = []
     with open(csv_path, 'w',) as file:
         writer = csv.writer(file)
         writer.writerow(["Encoded_file", "bpp", "psnr", 'ssim', 'sqnr','mape_phase', 'enc_time', 'dec_time',
@@ -165,7 +165,7 @@ def main():
 
                 y.append(out_enc["y"])
                 y_hat.append(out_enc["y_hat"])
-                z_hat.append(out_enc["z_hat"])
+                # z_hat.append(out_enc["z_hat"])
 
                 f_size_sarelic = Path(encode_path)
                 bpp = f_size_sarelic.stat().st_size * 8.0 / (gt_sar.size(0) * gt_sar.size(1) * gt_sar.size(2) * gt_sar.size(3))
@@ -239,7 +239,7 @@ def main():
     with h5py.File(output_file, 'w') as f:
         f.create_dataset("y", data=y)
         f.create_dataset("y_hat", data=y_hat)
-        f.create_dataset("z_hat", data=z_hat)
+        # f.create_dataset("z_hat", data=z_hat)
 
 if __name__ == '__main__':
     overall_start = time.time()
