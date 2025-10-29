@@ -1,33 +1,49 @@
-# Author: Paras Maharjan
-# Date: 01/26/2025
-# Description: Training script for End-to-End SAR Image Compression
+# Copyright 2020 InterDigital Communications, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+###############################################################################
+# Load the gcc version for compressai                                         #
+# module load gcc/11.2.0-gcc-8.3.0-cuda-11.2.2-ay27                           #
+###############################################################################
 
 import math
-import matplotlib.pyplot as plt
-import numpy as np
 import os
 import random
 import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
-from dct_fast import ImageDCT
-from ESICUtils.datasets import SarIQDataset
-from ESICUtils.utilis.utilis import DelfileList
-from ESICUtils.models.ESIC import ESIC
-from option import args
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio as PSNR, StructuralSimilarityIndexMeasure as SSIM
+from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+
+from ELICUtils.datasets import *
+from ELICUtils.encoding import *
+from ELICUtils.metrics import *
+from ELICUtils.models import *
+from ELICUtils.utils import *
+from options import args
+
 
 block_size = 4
 dct = ImageDCT(block_size)
-
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
 if args.seed is not None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -45,21 +61,46 @@ class RateDistortionLoss(nn.Module):
     Standard RD loss with Lagrangian parameter.
     - larger lambda -> more emphasis on distortion
     - Loss = lambda * MSE + BPP
+    
     """
 
     def __init__(self, lmbda=1e-2, loss=1, phase_loss=False, scheduled_phase=0.0, scaled_amp=False):
         super().__init__()
         self.mse             = nn.MSELoss()    # MSE loss
         self.l1_loss         = nn.L1Loss()     # L1 loss
+        self.nmse_loss       = NMSELoss(args)
+        self.corr_loss       = CorrLoss(args)
         self.lmbda           = lmbda * (15e-3)
+        self.phase_loss      = phase_loss
+        self.scheduled_phase = scheduled_phase
+        self.scaled_amp      = scaled_amp
         self.loss            = loss
-           
+
+    def generate_mask(self, image, percentiles=torch.tensor([605, 1092, 2092]), weights=torch.tensor([1/16, 1/8, 1/4, 1/2])):
+        mask = torch.zeros_like(image, dtype=float)  # Initialize mask with zeros
+
+        # Create boolean masks for each percentile range
+        mask_1 = torch.lt(image, percentiles[0])
+        mask_2 = torch.logical_and(torch.le(percentiles[0], image), torch.lt(image, percentiles[1]))
+        mask_3 = torch.logical_and(torch.le(percentiles[1], image), torch.lt(image,percentiles[2]))
+        mask_4 = torch.ge(image, percentiles[2])
+
+        # Assign weights based on the masks
+        mask[mask_1] = weights[0]
+        mask[mask_2] = weights[1]
+        mask[mask_3] = weights[2]
+        mask[mask_4] = weights[3]
+
+        return mask
+
+            
 
     def forward(self, output, target):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
 
+        #TODO: Need version of this for bypass (no likelihoods?)
         out["bpp_loss"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"].values() # information/ total pixels 
@@ -77,6 +118,18 @@ class RateDistortionLoss(nn.Module):
         if self.loss == 2:
             out["L1_loss"] = self.l1_loss(output["x_hat"], target) * 255
             out["loss"] = self.lmbda * out["L1_loss"] + out["bpp_loss"]
+        elif self.loss == 4:
+            # Compute nmse loss
+            unnorm_output = output["x_hat"] * (args.max_val - args.min_val) + args.min_val
+            unnorm_target = target * (args.max_val - args.min_val) + args.min_val
+            out["nmse_loss"] = self.nmse_loss(unnorm_output, unnorm_target)
+            out["loss"] = self.lmbda * out["nmse_loss"] + out["bpp_loss"]
+        elif self.loss == 5:
+            # Compute correlation loss
+            unnorm_output = output["x_hat"] * (args.max_val - args.min_val) + args.min_val
+            unnorm_target = target * (args.max_val - args.min_val) + args.min_val
+            out["corr_loss"] = 1 - self.corr_loss(unnorm_output, unnorm_target)
+            out["loss"] = self.lmbda * out["corr_loss"] + out["bpp_loss"]
         else:
             out["loss"] = self.lmbda * out["mse_loss"] + out["bpp_loss"]
 
@@ -172,13 +225,13 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
             gt_sar   = data[:,4:6,:,:]
         elif args.primary_pol == "VV":
             gt_sar   = data[:,6:8,:,:]        
-        gt_sar       = gt_sar.to(device)
-        d_dct        = dct.dct_2d(gt_sar)
+        gt_sar = gt_sar.to(device)
+        d_dct = dct.dct_2d(gt_sar)
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
-        out_net      = model(d_dct, mode_quant=noisequant)
-        out_criterion= criterion(out_net, gt_sar)
+        out_net = model(d_dct, noisequant)
 
+        out_criterion = criterion(out_net, gt_sar)
         train_bpp_loss.update(out_criterion["bpp_loss"].item())
         train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
         train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
@@ -207,9 +260,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 f"y_Bpp loss: {out_criterion['y_bpp_loss'].item():<7.4f} |"
                 f"z_Bpp loss: {out_criterion['z_bpp_loss'].item():<7.4f} |"
                 f"Aux loss: {aux_loss.item():<5.2f}")
-        if epoch == 5:
-            latent = out_net["y"]
-
     print(f"Lambda: {args.lmbda} | losstype: {args.loss}| "
         f"Train epoch {epoch}: Average losses:"
         f"Loss: {train_loss.avg:<7.3f} |"
@@ -218,26 +268,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         f"y_Bpp loss: {train_y_bpp_loss.avg:<8.5f} |"
         f"z_Bpp loss: {train_z_bpp_loss.avg:<8.5f} |"
         f"Time (s) : {time.time()-start:<7.4f} |")
-    if epoch == 5:
-        energy = torch.var(latent, dim=(2,3))
-        energy_mean = torch.mean(energy, dim=0)
-        energy_sorted, idx = torch.sort(energy_mean, descending=True)
 
-
-        plt.figure()
-        plt.plot(energy_mean.flatten())
-        plt.title("Energy (Avg of 1000 samples)")
-        plt.xlabel("Channel index")
-        plt.ylabel("Energy")
-        plt.grid()
-
-        plt.figure()
-        plt.plot(energy_sorted.flatten())
-        plt.title("Energy sorted (Avg of 1000 samples)")
-        plt.xlabel("Sorted channel index based on energy")
-        plt.ylabel("Energy")
-        plt.grid()
-        plt.show()
     return train_loss.avg, train_bpp_loss.avg, train_mse_loss.avg, train_psnr_avg.avg, train_ssim_avg.avg
 
 
@@ -267,8 +298,8 @@ def test_epoch(epoch, validation_dataloader, model, criterion):
                 gt_sar   = data[:,6:8,:,:]        
             gt_sar       = gt_sar.to(device)
             d_dct        = dct.dct_2d(gt_sar)
-            out_net      = model(d_dct)
-            out_criterion= criterion(out_net, gt_sar)
+            out_net = model(d_dct)
+            out_criterion = criterion(out_net, gt_sar)
 
             aux_loss.update(model.aux_loss().item())
             bpp_loss.update(out_criterion["bpp_loss"].item())
@@ -315,49 +346,44 @@ class CosineAnnealparameter():
     
 
 def main():
-    if args.dataset == 'NGA':
-        train_dataset       = SarIQDataset(args.train_dataset, 
-                                           train=True, 
-                                           names=False, 
-                                           min_val=args.min_val, 
-                                           max_val=args.max_val)
-        validation_dataset  = SarIQDataset(args.validation_dataset, 
-                                           train=False, 
-                                           names=False, 
-                                           min_val=args.min_val, 
-                                           max_val=args.max_val)           
+    if "0" in args.bypass_grps:
+        bypass_grps = []
+    else:
+        bypass_grps = [int(x)-1 for x in args.bypass_grps]
+        assert all(x in [0,1,2,3,4] for x in bypass_grps), "Valid bypass_grps: [0,1,2,3,4,5]"
 
-    train_dataloader        = DataLoader(train_dataset,
-                                        batch_size=args.batch_size,
-                                        num_workers=args.num_workers,
-                                        shuffle=True)
- 
-    validation_dataloader   = DataLoader(validation_dataset,
-                                        batch_size=args.test_batch_size,
-                                        num_workers=args.num_workers,
-                                        shuffle=False)
+    if args.dataset == 'NGA':
+        train_dataset = SarIQDataset(args.train_dataset, train=True)
+        validation_dataset  = SarIQDataset(args.validation_dataset, train=False)           
+
+    train_dataloader  = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True)
+
+    validation_dataloader = DataLoader(
+        validation_dataset,
+        batch_size=args.test_batch_size,
+        num_workers=args.num_workers,
+        shuffle=False)
     
-    net = ESIC(N=args.N, 
-               M=args.M, 
-               input_channels=args.inputchannels, 
-               num_slices=5, 
-               groups=[0, 16, 16, 32, 64, 192])
+    net = SAREliC(N=args.N, M=args.M, input_channels=args.inputchannels)
     net = net.to(device)
-    
     if not os.path.exists(args.checkpoint):
         try:
             os.mkdir(args.checkpoint)
         except:
             os.makedirs(args.checkpoint)
     
-    writer  = SummaryWriter(args.checkpoint)
+    writer = SummaryWriter(args.checkpoint)
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
 
-    lr_scheduler   = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
-    criterion      = RateDistortionLoss(lmbda=args.lmbda, loss=args.loss)
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+    criterion = RateDistortionLoss(lmbda=args.lmbda, loss=args.loss)
     test_criterion = RateDistortionLoss(lmbda=args.lmbda, loss=args.loss)
 
     last_epoch = 0

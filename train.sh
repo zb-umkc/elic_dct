@@ -1,0 +1,1 @@
+python3 train.py --mode train --primary_pol HH --bypass-grps "12345"
