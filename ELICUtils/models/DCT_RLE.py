@@ -79,6 +79,12 @@ class SAREliC(CompressionModel):
         num_slices=5,
         groups=[0, 16, 16, 32, 64, 192], # 16,16,32,64,M-128
         input_channels=3,
+        bypass_grps=[],
+        vals_codebook=[],
+        lens_codebook=[],
+        vals_min=0,
+        vals_p=[],
+        lens_p=[],
         **kwargs,
     ):
         """ELIC 2022; uneven channel groups with checkerboard context.
@@ -124,6 +130,12 @@ class SAREliC(CompressionModel):
         self.num_slices = num_slices
         self.groups = groups
         self.input_channels = input_channels
+        self.bypass_grps = bypass_grps
+        self.vals_codebook = vals_codebook
+        self.lens_codebook = lens_codebook
+        self.vals_min = vals_min
+        self.vals_p = vals_p
+        self.lens_p = lens_p
 
         self.g_a = nn.Sequential(
             conv(self.input_channels*4*4, N, kernel_size=5, stride=1),
@@ -246,52 +258,82 @@ class SAREliC(CompressionModel):
 
     def forward(self, x, mode_quant="ste"):
         y = self.g_a(x)
-        z = self.h_a(y)
-        z_hat, z_likelihoods = self.entropy_bottleneck(z)
 
-        if mode_quant == "ste":
-            z_offset = self.entropy_bottleneck._get_medians()
-            z_hat = ste_round(z - z_offset) + z_offset
+        if len(self.bypass_grps) < 5:
+            z = self.h_a(y)
+            z_hat, z_likelihoods = self.entropy_bottleneck(z)
 
-        latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+            if mode_quant == "ste":
+                z_offset = self.entropy_bottleneck._get_medians()
+                z_hat = ste_round(z - z_offset) + z_offset
 
-        # Extract anchor and non-anchors for each channel group:
-        anchor = torch.zeros_like(y)
-        non_anchor = torch.zeros_like(y)
-        self._copy(anchor, y, "anchor")
-        self._copy(non_anchor, y, "non_anchor")
-        anchor_split = torch.split(anchor, self.groups[1:], dim=1)
-        non_anchor_split = torch.split(non_anchor, self.groups[1:], dim=1)
+            latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
+
+            # Extract anchor and non-anchors for each channel group:
+            anchor = torch.zeros_like(y)
+            non_anchor = torch.zeros_like(y)
+            self._copy(anchor, y, "anchor")
+            self._copy(non_anchor, y, "non_anchor")
+            anchor_split = torch.split(anchor, self.groups[1:], dim=1)
+            non_anchor_split = torch.split(non_anchor, self.groups[1:], dim=1)
+        else:
+            z_likelihoods = torch.ones(1, device=y.device)
 
         y_slices = torch.split(y, self.groups[1:], dim=1)
 
         y_likelihood = []
+        vals_likelihood = []
+        lens_likelihood = []
         y_hat_slices = []
         y_hat_slices_for_gs = []
+        y_strings = []
+        headers = {}
 
         for slice_index, y_slice in enumerate(y_slices):
-            support = self._calculate_support(
-                slice_index, y_hat_slices, latent_means, latent_scales
-            )
 
-            y_hat_i, y_hat_for_gs_i, y_likelihood_i = self._checkerboard_forward(
-                [y_slice, anchor_split[slice_index], non_anchor_split[slice_index]],
-                slice_index,
-                support,
-                mode_quant=mode_quant,
-            )
+            if slice_index in self.bypass_grps:
+                y_hat_i, y_hat_for_gs_i, vals_likelihood_i, lens_likelihood_i = _rle_bypass_likelihoods(y_slice)
+                
+                y_hat_slices.append(y_hat_i)
+                y_hat_slices_for_gs.append(y_hat_for_gs_i)
+                y_likelihood.append(torch.ones_like(y_hat_i))
+                vals_likelihood.append(vals_likelihood_i)
+                lens_likelihood.append(lens_likelihood_i)
+                
+            else:
+                support = self._calculate_support(
+                    slice_index, y_hat_slices, latent_means, latent_scales
+                )
 
-            y_hat_slices.append(y_hat_i)
-            y_hat_slices_for_gs.append(y_hat_for_gs_i)
-            y_likelihood.append(y_likelihood_i)
+                y_hat_i, y_hat_for_gs_i, y_likelihood_i = self._checkerboard_forward(
+                    [y_slice, anchor_split[slice_index], non_anchor_split[slice_index]],
+                    slice_index,
+                    support,
+                    mode_quant=mode_quant,
+                )
 
+                y_hat_slices.append(y_hat_i)
+                y_hat_slices_for_gs.append(y_hat_for_gs_i)
+                y_likelihood.append(y_likelihood_i)
+                vals_likelihood.append(torch.ones_like(y_hat_i.flatten()))
+                lens_likelihood.append(torch.ones_like(y_hat_i.flatten()))
+
+        
         y_likelihoods = torch.cat(y_likelihood, dim=1)
+        vals_likelihoods = torch.cat(vals_likelihood, dim=0)
+        lens_likelihoods = torch.cat(lens_likelihood, dim=0)
+
         y_hat = torch.cat(y_hat_slices_for_gs, dim=1)
         x_hat = self.g_s(y_hat)
 
         return {
             "x_hat": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "likelihoods": {
+                "y": y_likelihoods,
+                "z": z_likelihoods,
+                "vals": vals_likelihoods,
+                "lens": lens_likelihoods
+            },
         }
 
     def load_state_dict(self, state_dict):
@@ -330,7 +372,7 @@ class SAREliC(CompressionModel):
         bitstring = bin(int.from_bytes(b, "big"))[2:].zfill(len(b) * 8)
         return bitstring[:-padding] if padding else bitstring
 
-    def compress(self, x, bypass_grps=[], vals_codebook=[], lens_codebook=[], vals_min=0):
+    def compress(self, x):
         y_enc_start = time.time()
         y = self.g_a(x)
         y_enc = time.time() - y_enc_start
@@ -362,8 +404,13 @@ class SAREliC(CompressionModel):
 
             for slice_index, y_slice in enumerate(y_slices):
                 slice_start = time.time()
-                if slice_index in bypass_grps:
-                    y_strings_i, y_hat_i, header = self._rle_bypass_encode(y_slice, vals_codebook, lens_codebook, vals_min)
+                if slice_index in self.bypass_grps:
+                    y_strings_i, y_hat_i, header = self._rle_bypass_encode(
+                        y_slice,
+                        self.vals_codebook,
+                        self.lens_codebook,
+                        self.vals_min
+                    )
                     headers[slice_index] = header
                     vals_strings_pad = self.str_to_bytes(y_strings_i[0])
                     lens_strings_pad = self.str_to_bytes(y_strings_i[1])
@@ -420,7 +467,7 @@ class SAREliC(CompressionModel):
         return out_enc
 
 
-    def decompress(self, strings, shape, bypass_grps, out_enc, vals_codebook=[], lens_codebook=[], vals_min=0):
+    def decompress(self, strings, shape, out_enc):
         assert isinstance(strings, list) and len(strings) == 2
         [y_strings, z_strings] = strings
 
@@ -436,7 +483,7 @@ class SAREliC(CompressionModel):
 
             for slice_index in range(len(self.groups) - 1):
                 slice_start = time.time()
-                if slice_index in bypass_grps:
+                if slice_index in self.bypass_grps:
                     vals_strings_pad, lens_strings_pad = y_strings[slice_index]
                     vals_strings = self.bytes_to_str(vals_strings_pad)
                     lens_strings = self.bytes_to_str(lens_strings_pad)
@@ -444,9 +491,9 @@ class SAREliC(CompressionModel):
                     y_hat_i = self._rle_bypass_decode(
                         y_strings=y_strings_i,
                         header=out_enc['headers'][slice_index],
-                        vals_codebook=vals_codebook,
-                        lens_codebook=lens_codebook,
-                        vals_min=vals_min
+                        vals_codebook=self.vals_codebook,
+                        lens_codebook=self.lens_codebook,
+                        vals_min=self.vals_min
                     )
                     y_hat_slices.append(y_hat_i)
 
@@ -668,6 +715,16 @@ class SAREliC(CompressionModel):
         y_strings = [anchor_strings, non_anchor_strings]
 
         return y_hat, y_strings
+
+
+    def _rle_bypass_likelihoods(self, y):
+        y_hat, y_hat_for_gs = self._apply_quantizer(y, 0, "noise")
+        vals, lens = rle_encode(y_hat)
+        vals_likelihood = [self.vals_p[sym] for sym in vals]
+        lens_likelihood = [self.lens_p[sym] for sym in lens]
+        
+        return y_hat, y_hat_for_gs, vals_likelihood, lens_likelihood
+
 
     def _rle_bypass_encode(self, y, vals_codebook, lens_codebook, vals_min):
         y_shape = y.shape

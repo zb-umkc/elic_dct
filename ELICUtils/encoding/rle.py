@@ -220,13 +220,17 @@ def build_huffman_codebook(arr):
     Returns a list `codebook` where index i gives the bitstring for symbol i.
     """
     freq = Counter(arr.tolist())
+    total_count = sum(freq.values())
+
     if len(freq) == 1:
         # Edge case: only one symbol
         symbol = next(iter(freq))
         max_sym = symbol
         codebook = ["0"] * (max_sym + 1)
         codebook[symbol] = "0"
-        return codebook
+        probabilities = [0.0] * (max_sym + 1)
+        probabilities[symbol] = 1.0
+        return codebook, probabilities
 
     # Build Huffman tree using a min-heap
     heap = [[wt, [sym, ""]] for sym, wt in freq.items()]
@@ -247,10 +251,13 @@ def build_huffman_codebook(arr):
     # Create list-based codebook
     max_sym = max(freq.keys())
     codebook = [""] * (max_sym + 1)
+    probabilities = [0.0] * (max_sym + 1)
+
     for sym, code in huff_codes:
         codebook[sym] = code
+        probabilities[sym] = freq[sym] / total_count
 
-    return codebook
+    return codebook, probabilities
 
 
 def huffman_encode(arr, codebook):

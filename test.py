@@ -85,8 +85,8 @@ def main():
         vals, lens = rle_encode(y_hat)
         vals_min = np.min(vals)
         vals_adj = vals - vals_min
-        vals_codebook = build_huffman_codebook(vals_adj)
-        lens_codebook = build_huffman_codebook(lens)
+        vals_codebook, _ = build_huffman_codebook(vals_adj)
+        lens_codebook, _ = build_huffman_codebook(lens)
         
     print("### CODEBOOKS COMPLETE ###\n")
     #############################
@@ -126,7 +126,7 @@ def main():
                 # print("Avg encode time: %.4f"%(avg_time/10))
                 
                 start_time = time.time()
-                out_enc = model.compress(image_dct, bypass_grps, vals_codebook, lens_codebook, vals_min)
+                out_enc = model.compress(x=image_dct)
                 enc_time = time.time() - start_time
 
                 # save the encoded files
@@ -147,9 +147,11 @@ def main():
 
 
                 start_time = time.time()
-                out_dec = model.decompress(strings, torch.Size([args.patch_size[0]//64, args.patch_size[0]//64]),
-                                                            bypass_grps=bypass_grps, out_enc=out_enc, vals_codebook=vals_codebook, 
-                                                            lens_codebook=lens_codebook, vals_min=vals_min)
+                out_dec = model.decompress(
+                    strings=strings,
+                    shape=torch.Size([args.patch_size[0]//64, args.patch_size[0]//64]),
+                    out_enc=out_enc
+                )
                 dec_time = time.time() - start_time
 
                 y.append(out_enc["y"])
