@@ -34,7 +34,8 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
 from ELICUtils.datasets import *
 from ELICUtils.encoding import *
 from ELICUtils.metrics import *
-from ELICUtils.models import *
+from ELICUtils.models.DCT_grps import *
+# from ELICUtils.models.DCT_RLE import *
 from ELICUtils.utils import *
 from options import args
 
@@ -111,14 +112,6 @@ class RateDistortionLoss(nn.Module):
         out["z_bpp_loss"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"]["z"]
-        )
-        out["vals_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["vals"]
-        )
-        out["lens_bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"]["lens"]
         )
         out["mse_loss"] = self.mse(output["x_hat"], target) * 255 ** 2
 
@@ -217,8 +210,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
     train_bpp_loss      = AverageMeter()
     train_y_bpp_loss    = AverageMeter()
     train_z_bpp_loss    = AverageMeter()
-    train_vals_bpp_loss = AverageMeter()
-    train_lens_bpp_loss = AverageMeter()
     train_mse_loss      = AverageMeter()
     train_psnr_avg      = AverageMeter()
     train_ssim_avg      = AverageMeter()
@@ -244,8 +235,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         train_bpp_loss.update(out_criterion["bpp_loss"].item())
         train_y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
         train_z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-        train_vals_bpp_loss.update(out_criterion["vals_bpp_loss"].item())
-        train_lens_bpp_loss.update(out_criterion["lens_bpp_loss"].item())
         train_loss.update(out_criterion["loss"].item())
         train_mse_loss.update(out_criterion["mse_loss"].item())
         train_psnr_avg.update(PSNR(out_net["x_hat"], gt_sar).item())
@@ -270,19 +259,16 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 f"Bpp loss: {out_criterion['bpp_loss'].item():<7.3f} |"
                 f"y_Bpp loss: {out_criterion['y_bpp_loss'].item():<7.4f} |"
                 f"z_Bpp loss: {out_criterion['z_bpp_loss'].item():<7.4f} |"
-                f"vals_Bpp loss: {out_criterion['vals_bpp_loss'].item():<7.4f} |"
-                f"lens_Bpp loss: {out_criterion['lens_bpp_loss'].item():<7.4f} |"
                 f"Aux loss: {aux_loss.item():<5.2f}")
     print(f"Lambda: {args.lmbda} | losstype: {args.loss}| "
-        f"Train epoch {epoch}: Average losses:"
+        f"Train epoch {epoch}:"
         f"Loss: {train_loss.avg:<7.3f} |"
         f"MSE loss: {train_mse_loss.avg:<7.3f} |"
         f"Bpp loss: {train_bpp_loss.avg:<7.4f} |"
         f"y_Bpp loss: {train_y_bpp_loss.avg:<8.5f} |"
         f"z_Bpp loss: {train_z_bpp_loss.avg:<8.5f} |"
-        f"vals_Bpp loss: {train_vals_bpp_loss.avg:<8.5f} |"
-        f"lens_Bpp loss: {train_lens_bpp_loss.avg:<8.5f} |"
-        f"Time (s) : {time.time()-start:<7.4f} |")
+        f"Time (s) : {time.time()-start:<7.4f} |"
+        f"Group Sizes: {out_net['group_sizes'].tolist()}")
 
     return train_loss.avg, train_bpp_loss.avg, train_mse_loss.avg, train_psnr_avg.avg, train_ssim_avg.avg
 
@@ -295,8 +281,6 @@ def test_epoch(epoch, validation_dataloader, model, criterion):
     bpp_loss        = AverageMeter()
     y_bpp_loss      = AverageMeter()
     z_bpp_loss      = AverageMeter()
-    vals_bpp_loss   = AverageMeter()
-    lens_bpp_loss   = AverageMeter()
     mse_loss        = AverageMeter()
     aux_loss        = AverageMeter()
     test_psnr_avg   = AverageMeter()
@@ -322,8 +306,6 @@ def test_epoch(epoch, validation_dataloader, model, criterion):
             bpp_loss.update(out_criterion["bpp_loss"].item())
             y_bpp_loss.update(out_criterion["y_bpp_loss"].item())
             z_bpp_loss.update(out_criterion["z_bpp_loss"].item())
-            vals_bpp_loss.update(out_criterion["vals_bpp_loss"].item())
-            lens_bpp_loss.update(out_criterion["lens_bpp_loss"].item())
             loss.update(out_criterion["loss"].item())
             mse_loss.update(out_criterion["mse_loss"].item())
             test_psnr_avg.update(PSNR(out_net["x_hat"], gt_sar).item())
@@ -336,9 +318,8 @@ def test_epoch(epoch, validation_dataloader, model, criterion):
         f"Bpp loss: {bpp_loss.avg:<7.4f} |"
         f"y_Bpp loss: {y_bpp_loss.avg:<7.4f} |"
         f"z_Bpp loss: {z_bpp_loss.avg:<7.4f} |"
-        f"vals_Bpp loss: {vals_bpp_loss.avg:<7.4f} |"
-        f"lens_Bpp loss: {lens_bpp_loss.avg:<7.4f} |"
-        f"Aux loss: {aux_loss.avg:<7.4f}\n")
+        f"Aux loss: {aux_loss.avg:<7.4f} |"
+        f"Group Sizes: {out_net['group_sizes'].tolist()}\n")
 
     return loss.avg, bpp_loss.avg, mse_loss.avg, test_psnr_avg.avg, test_ssim_avg.avg
 
@@ -364,50 +345,9 @@ class CosineAnnealparameter():
 
     def get_last_lr(self):
         return [self.step()]
-    
-
-def build_codebooks(data_loader, model):
-    print("### BUILDING CODEBOOKS ###")
-    y = []
-    with torch.no_grad():
-        for i, data in tqdm(enumerate(data_loader)):
-            im_name      = data['name']
-            data         = data['gt_pol'].to(device)
-            if args.primary_pol == "HH":
-                gt_sar   = data[:,0:2,:,:]
-            elif args.primary_pol == "HV":
-                gt_sar   = data[:,2:4,:,:]
-            elif args.primary_pol == "VH":
-                gt_sar   = data[:,4:6,:,:]
-            elif args.primary_pol == "VV":
-                gt_sar   = data[:,6:8,:,:]
-
-            gt_sar = gt_sar.to(device)
-            image_dct = dct.dct_2d(gt_sar)
-            y_i = model.g_a(image_dct)
-            y.append(y_i)
-
-        y = torch.cat(y, dim=0)
-        y_hat = torch.flatten(y).round().int().cpu().numpy()
-
-        vals, lens = rle_encode(y_hat)
-        vals_min = np.min(vals)
-        vals_adj = vals - vals_min
-        vals_codebook, vals_p = build_huffman_codebook(vals_adj)
-        lens_codebook, lens_p = build_huffman_codebook(lens)
-        
-    print("### CODEBOOKS COMPLETE ###\n")
-
-    return vals_codebook, lens_codebook, vals_min, vals_p, lens_p
 
 
 def main():
-    if "0" in args.bypass_grps:
-        bypass_grps = []
-    else:
-        bypass_grps = [int(x)-1 for x in args.bypass_grps]
-        assert all(x in [0,1,2,3,4] for x in bypass_grps), "Valid bypass_grps: [0,1,2,3,4,5]"
-
     if args.dataset == 'NGA':
         train_dataset = SarIQDataset(args.train_dataset, train=True)
         validation_dataset  = SarIQDataset(args.validation_dataset, train=False)           
@@ -428,29 +368,8 @@ def main():
         N=args.N,
         M=args.M,
         input_channels=args.inputchannels,
-        bypass_grps=bypass_grps,
-        vals_codebook=vals_codebook,
-        lens_codebook=lens_codebook,
-        vals_min=vals_min,
-        vals_p=vals_p,
-        lens_p=lens_p,
     )
     net = net.to(device)
-
-    if len(bypass_grps) > 0:
-        vals_codebook, lens_codebook, vals_min, vals_p, lens_p = build_codebooks(train_dataloader, net)
-    else:
-        vals_codebook = []
-        lens_codebook = []
-        vals_min = 0
-        vals_p = []
-        lens_p = []
-
-    print(vals_p.shape)
-    print(np.sum(vals_p))
-    print(lens_p.shape)
-    print(np.sum(lens_p))
-    sys.exit()
 
     if not os.path.exists(args.checkpoint):
         try:

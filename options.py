@@ -88,7 +88,7 @@ if args.mode == "train":
     assert os.path.exists(args.validation_dataset), "Validation dataset path not found"
     args.checkpoint = os.path.join(home_path, args.checkpoint)
     #assert os.path.exists(args.checkpoint), "Checkpoint path not found"
-    args.checkpoint = os.path.join(args.checkpoint, "%s_%s_DCTv2_MST_p%db%d_N%dM%d_loss%d_lmbda%.2f"%(args.dataset, args.datatype, args.patch_size[0], args.batch_size, args.N, args.M, args.loss, args.lmbda))
+    args.checkpoint = os.path.join(args.checkpoint, "%s_DCT_grpsizes_M%d_lmbda%.1f"%(args.dataset, args.M, args.lmbda))
     if os.path.exists(args.checkpoint):
         print("Checkpoint path already exists")
         args.checkpoint = os.path.join(args.checkpoint, time.strftime("%Y%m%d-%H%M%S"))

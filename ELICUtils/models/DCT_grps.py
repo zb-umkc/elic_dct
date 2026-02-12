@@ -3,11 +3,13 @@ A simple test algorithm to rewrite the network
 """
 import math
 import time
+import sys
 from thop import profile
 from ptflops import get_model_complexity_info
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from timm.layers import trunc_normal_
 from compressai.layers import (
@@ -70,6 +72,131 @@ class Quantizer():
             return torch.round(inputs) - inputs.detach() + inputs
         else:
             return torch.round(inputs)
+        
+
+# class LearnableGroupSizes(nn.Module):
+#     def __init__(self, G):
+#         super().__init__()
+#         self.G = G
+#         self.logits = nn.Parameter(torch.zeros(G))
+
+#     def forward(self):
+#         p = torch.softmax(self.logits, dim=0)
+#         return p
+    
+
+# class SoftChannelGrouping(nn.Module):
+#     def __init__(self, M, temperature=0.01):
+#         super().__init__()
+#         self.M = M
+#         self.temperature = temperature
+
+#     def forward(self, proportions):
+#         """
+#         proportions: tensor of shape [G]
+#         returns: assignment matrix of shape [M, G]
+#         """
+#         G = proportions.size(0)
+
+#         # cumulative boundaries
+#         boundaries = torch.cumsum(proportions, dim=0)  # [p1, p1+p2, ...]
+#         boundaries = torch.cat([torch.tensor([0.0], device=proportions.device),
+#                                 boundaries], dim=0)  # shape [G+1]
+
+#         # normalized channel positions
+#         channel_pos = torch.linspace(0, 1, self.M, device=proportions.device)  # [M]
+
+#         # Soft indicator per group
+#         W = []
+#         for i in range(G):
+#             left = boundaries[i]
+#             right = boundaries[i+1]
+
+#             # Smooth step functions (low temp -> steeper curve)
+#             left_mask  = torch.sigmoid((channel_pos - left)  / self.temperature)
+#             right_mask = torch.sigmoid((channel_pos - right) / self.temperature)
+
+#             group_mask = left_mask - right_mask  # [M]
+#             W.append(group_mask)
+
+#         W = torch.stack(W, dim=1)  # [M, G]
+
+#         # Normalize so each channel sums to 1 across groups
+#         W = W / (W.sum(dim=1, keepdim=True) + 1e-6)
+
+#         return W
+    
+
+class STEGroupSizes(nn.Module):
+    """
+    Learnable contiguous partition of latent channels using STE.
+    """
+    def __init__(self, num_channels=320, num_groups=5, group_size_init=None):
+        super().__init__()
+        self.C = num_channels
+        self.G = num_groups
+        
+        # Learnable logits for softmax proportions
+        if group_size_init is not None:
+            groups = torch.tensor(group_size_init)
+            assert self.C == groups.sum()
+            assert self.G == len(groups)
+            probs = groups/self.C
+            self.logits = nn.Parameter(torch.log(probs) - torch.log(probs).mean())
+        else:
+            self.logits = nn.Parameter(torch.zeros(self.G))
+
+    def soft_intervals(self, pos, bounds, sharpness=500.0):
+        """
+        pos: channel positions [C] normalized 0..1
+        bounds: cumulative boundaries [G]
+        Returns soft membership: [G, C]
+        """
+        C = pos.shape[0]
+        G = bounds.shape[0]
+
+        # Start and end of each interval
+        start = torch.cat([torch.tensor([0.0], device=bounds.device), bounds[:-1]])
+        end   = bounds
+
+        # Soft "inside the interval" indicator using sigmoid edges
+        left  = torch.sigmoid(sharpness * (pos[None, :] - start[:, None]))
+        right = torch.sigmoid(-sharpness * (pos[None, :] - end[:, None]))
+        soft = left * right
+        soft = soft / (soft.sum(dim=0, keepdim=True) + 1e-8)
+
+        return soft  # shape [G, C]
+
+    def forward(self):
+        """
+        Output:
+            mask: [G, C] -- straight-through hard assignment mask
+            soft: [G, C] -- soft assignment (useful for debugging)
+        """
+        # Proportions
+        probs = F.softmax(self.logits, dim=0)  # shape [G]
+        bounds = torch.cumsum(probs, dim=0)    # cumulative
+        
+        # Channel positions [C] in [0, 1]
+        pos = torch.linspace(0, 1, self.C, device=self.logits.device)
+
+        # Soft memberships
+        soft = self.soft_intervals(pos, bounds)  # [G, C]
+
+        # Hard memberships (one-hot)
+        hard_idx = torch.argmax(soft, dim=0)     # [C]
+        hard = F.one_hot(hard_idx, num_classes=self.G).float().t()  # [G, C]
+        group_sizes = torch.bincount(hard_idx, minlength=self.G)
+
+        # Straight-through estimator:
+        mask = hard + soft - soft.detach()       # Hard forward, soft backward
+        # print(mask.shape)
+        # print(mask[0])
+        # print(mask[1])
+        # print(mask[2])
+
+        return mask, soft, group_sizes
+
 
 class SAREliC(CompressionModel):
     def __init__(
@@ -79,12 +206,6 @@ class SAREliC(CompressionModel):
         num_slices=5,
         groups=[0, 16, 16, 32, 64, 192], # 16,16,32,64,M-128
         input_channels=3,
-        bypass_grps=[],
-        vals_codebook=[],
-        lens_codebook=[],
-        vals_min=0,
-        vals_p=[],
-        lens_p=[],
         **kwargs,
     ):
         """ELIC 2022; uneven channel groups with checkerboard context.
@@ -130,12 +251,13 @@ class SAREliC(CompressionModel):
         self.num_slices = num_slices
         self.groups = groups
         self.input_channels = input_channels
-        self.bypass_grps = bypass_grps
-        self.vals_codebook = vals_codebook
-        self.lens_codebook = lens_codebook
-        self.vals_min = vals_min
-        self.vals_p = vals_p
-        self.lens_p = lens_p
+        # self.proportions_module = LearnableGroupSizes(self.num_slices)
+        # self.assignment_module = SoftChannelGrouping(M=self.M, temperature=0.01)
+        self.grouping_module = STEGroupSizes(
+            num_channels=self.M,
+            num_groups=self.num_slices,
+            group_size_init=[16, 16, 32, 64, 192],
+        )
 
         self.g_a = nn.Sequential(
             conv(self.input_channels*4*4, N, kernel_size=5, stride=1),
@@ -196,7 +318,8 @@ class SAREliC(CompressionModel):
             nn.Sequential(
                 conv(
                     # Input: first group, and most recently decoded group.
-                    self.groups[1] + (i > 1) * self.groups[i],
+                    self.M + (i > 1) * self.M,
+                    # self.groups[1] + (i > 1) * self.groups[i],
                     224,
                     stride=1,
                     kernel_size=5,
@@ -204,7 +327,8 @@ class SAREliC(CompressionModel):
                 nn.ReLU(inplace=True),
                 conv(224, 128, stride=1, kernel_size=5),
                 nn.ReLU(inplace=True),
-                conv(128, self.groups[i + 1] * 2, stride=1, kernel_size=5),
+                conv(128, self.M * 2, stride=1, kernel_size=5),
+                # conv(128, self.groups[i + 1] * 2, stride=1, kernel_size=5),
             )
             for i in range(1, num_slices)
         )  ## from https://github.com/tensorflow/compression/blob/master/models/ms2020.py
@@ -213,7 +337,8 @@ class SAREliC(CompressionModel):
         # spatial_context
         self.context_prediction = nn.ModuleList(
             CheckerboardMaskedConv2d(
-                self.groups[i], self.groups[i] * 2, kernel_size=5, padding=2, stride=1
+                self.M, self.M * 2, kernel_size=5, padding=2, stride=1
+                # self.groups[i], self.groups[i] * 2, kernel_size=5, padding=2, stride=1
             )
             for i in range(1, num_slices + 1)
         )  ## from https://github.com/JiangWeibeta/Checkerboard-Context-Model-for-Efficient-Learned-Image-Compression/blob/main/version2/layers/CheckerboardContext.py
@@ -223,13 +348,15 @@ class SAREliC(CompressionModel):
             nn.Sequential(
                 conv1x1(
                     # Input: spatial context, channel context, and hyper params.
-                    self.groups[i] * 2 + (i > 1) * self.groups[i] * 2 + M * 2,
-                    M * 2,
+                    (self.M * 2) + ((i > 1) * self.M * 2) + (self.M * 2),
+                    # self.groups[i] * 2 + (i > 1) * self.groups[i] * 2 + M * 2,
+                    self.M * 2,
                 ),
                 nn.ReLU(inplace=True),
-                conv1x1(M * 2, 512),
+                conv1x1(self.M * 2, 512),
                 nn.ReLU(inplace=True),
-                conv1x1(512, self.groups[i] * 2),
+                conv1x1(512, self.M * 2),
+                # conv1x1(512, self.groups[i] * 2),
             )
             for i in range(1, num_slices + 1)
         )  ##from checkboard "Checkerboard Context Model for Efficient Learned Image Compression"" gepç½ç»åæ°
@@ -256,6 +383,22 @@ class SAREliC(CompressionModel):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
 
+    def apply_group_mask(self, y, mask):
+        """
+        y: [B, C, H, W]
+        mask: [G, C]
+        Returns:
+            groups: list of G tensors, each [B, C, H, W]
+        """
+        B, C, H, W = y.shape
+        G = mask.shape[0]
+
+        groups = []
+        for g in range(G):
+            w = mask[g].view(1, C, 1, 1)   # broadcast
+            groups.append(y * w)
+        return groups
+
     def forward(self, x, mode_quant="ste"):
         y = self.g_a(x)
 
@@ -268,15 +411,32 @@ class SAREliC(CompressionModel):
 
         latent_means, latent_scales = self.h_s(z_hat).chunk(2, 1)
 
-        # Extract anchor and non-anchors for each channel group:
-        anchor = torch.zeros_like(y)
-        non_anchor = torch.zeros_like(y)
-        self._copy(anchor, y, "anchor")
-        self._copy(non_anchor, y, "non_anchor")
-        anchor_split = torch.split(anchor, self.groups[1:], dim=1)
-        non_anchor_split = torch.split(non_anchor, self.groups[1:], dim=1)
+        # # Soft group assignment for latents
+        # B, M, H, W = y.shape
+        # proportions = self.proportions_module()  # [G]
+        # assignments = self.assignment_module(proportions)  # [M, G]
 
-        y_slices = torch.split(y, self.groups[1:], dim=1)
+        mask, soft, group_sizes = self.grouping_module()
+        y_slices = self.apply_group_mask(y, mask)  # list of G tensors
+        
+        # y_slices = []
+        anchor_slices = []
+        non_anchor_slices = []
+        for y_i in y_slices:
+            # # Expand assignment weights to broadcast over spatial dims
+            # w = assignments[:, i].view(1, M, 1, 1)  # shape [1,M,1,1]
+
+            # # Weighted mask (effectively zeroes out contributions of channels not in group i)
+            # y_i = y * w
+            # y_slices.append(y_i)
+
+            # Extract anchor and non-anchors for each channel group:
+            anchor_i = torch.zeros_like(y_i)
+            non_anchor_i = torch.zeros_like(y_i)
+            self._copy(anchor_i, y_i, "anchor") # Copies latent values for anchor positions only
+            self._copy(non_anchor_i, y_i, "non_anchor") # Same for non-anchors
+            anchor_slices.append(anchor_i)
+            non_anchor_slices.append(non_anchor_i)
 
         y_likelihood = []
         y_hat_slices = []
@@ -287,8 +447,12 @@ class SAREliC(CompressionModel):
                 slice_index, y_hat_slices, latent_means, latent_scales
             )
 
+            # print(f"slice_index: {slice_index}")
+            # print(f"support: {support.shape}")
+            # print(f"y_hat_i: {y_slice.shape}, anchor: {anchor_slices[slice_index].shape}, non_anchor: {non_anchor_slices[slice_index].shape}")
+
             y_hat_i, y_hat_for_gs_i, y_likelihood_i = self._checkerboard_forward(
-                [y_slice, anchor_split[slice_index], non_anchor_split[slice_index]],
+                [y_slice, anchor_slices[slice_index], non_anchor_slices[slice_index]],
                 slice_index,
                 support,
                 mode_quant=mode_quant,
@@ -299,8 +463,8 @@ class SAREliC(CompressionModel):
             y_likelihood.append(y_likelihood_i)
 
         y_likelihoods = torch.cat(y_likelihood, dim=1)
+        y_hat = torch.stack(y_hat_slices_for_gs, dim=0).sum(dim=0)  # [B,C,H,W]
 
-        y_hat = torch.cat(y_hat_slices_for_gs, dim=1)
         x_hat = self.g_s(y_hat)
 
         return {
@@ -309,6 +473,7 @@ class SAREliC(CompressionModel):
                 "y": y_likelihoods,
                 "z": z_likelihoods,
             },
+            "group_sizes": group_sizes,
         }
 
     def load_state_dict(self, state_dict):
@@ -333,28 +498,11 @@ class SAREliC(CompressionModel):
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
         return updated
-    
-    def str_to_bytes(self, bitstring: str) -> bytes:
-        # Pad to a multiple of 8 so int() works
-        padding = (8 - len(bitstring) % 8) % 8
-        bitstring_padded = bitstring + "0" * padding
-        return int(bitstring_padded, 2).to_bytes(len(bitstring_padded) // 8, "big"), padding
-
-    def bytes_to_str(self, strings_pad) -> str:
-        # Get binary string and trim padding
-        b = strings_pad[0]
-        padding = strings_pad[1]
-        bitstring = bin(int.from_bytes(b, "big"))[2:].zfill(len(b) * 8)
-        return bitstring[:-padding] if padding else bitstring
 
     def compress(self, x):
         y_enc_start = time.time()
         y = self.g_a(x)
         y_enc = time.time() - y_enc_start
-        # print(f"0: {y[:, 0, :, :].min()}")
-        # print(f"1: {y[:, 1, :, :].min()}")
-        #var_latent = torch.var(y, dim=(2,3))
-        #val, idx = torch.sort(var_latent, descending=True)
 
         z_enc_start = time.time()
         z = self.h_a(y)
@@ -375,39 +523,23 @@ class SAREliC(CompressionModel):
         for it in range(iterations+1):
             y_strings = []
             y_hat_slices = []
-            headers = {}
 
             for slice_index, y_slice in enumerate(y_slices):
                 slice_start = time.time()
-                if slice_index in self.bypass_grps:
-                    y_strings_i, y_hat_i, header = self._rle_bypass_encode(
-                        y_slice,
-                        self.vals_codebook,
-                        self.lens_codebook,
-                        self.vals_min
-                    )
-                    headers[slice_index] = header
-                    vals_strings_pad = self.str_to_bytes(y_strings_i[0])
-                    lens_strings_pad = self.str_to_bytes(y_strings_i[1])
+                support = self._calculate_support(
+                    slice_index, y_hat_slices, latent_means, latent_scales
+                )
 
-                    y_hat_slices.append(y_hat_i)
-                    y_strings.append((vals_strings_pad, lens_strings_pad))
+                y_hat_i, y_strings_i = self._checkerboard_codec(
+                    [y_slice.clone(), y_slice.clone()],
+                    slice_index,
+                    support,
+                    y_shape=y.shape[-2:],
+                    mode="compress",
+                )
 
-                else:
-                    support = self._calculate_support(
-                        slice_index, y_hat_slices, latent_means, latent_scales
-                    )
-
-                    y_hat_i, y_strings_i = self._checkerboard_codec(
-                        [y_slice.clone(), y_slice.clone()],
-                        slice_index,
-                        support,
-                        y_shape=y.shape[-2:],
-                        mode="compress",
-                    )
-
-                    y_hat_slices.append(y_hat_i)
-                    y_strings.append(y_strings_i)
+                y_hat_slices.append(y_hat_i)
+                y_strings.append(y_strings_i)
 
                 # Warmup
                 if it > 0:
@@ -430,7 +562,6 @@ class SAREliC(CompressionModel):
             "y": y,
             "y_hat": y_hat,
             "z_hat": z_hat,
-            "headers": headers,
             "time": {
                 "y_enc": y_enc,
                 "z_enc": z_enc,
@@ -458,34 +589,19 @@ class SAREliC(CompressionModel):
 
             for slice_index in range(len(self.groups) - 1):
                 slice_start = time.time()
-                if slice_index in self.bypass_grps:
-                    vals_strings_pad, lens_strings_pad = y_strings[slice_index]
-                    vals_strings = self.bytes_to_str(vals_strings_pad)
-                    lens_strings = self.bytes_to_str(lens_strings_pad)
-                    y_strings_i = (vals_strings, lens_strings)
-                    y_hat_i = self._rle_bypass_decode(
-                        y_strings=y_strings_i,
-                        header=out_enc['headers'][slice_index],
-                        vals_codebook=self.vals_codebook,
-                        lens_codebook=self.lens_codebook,
-                        vals_min=self.vals_min
-                    )
-                    y_hat_slices.append(y_hat_i)
+                support = self._calculate_support(
+                    slice_index, y_hat_slices, latent_means, latent_scales
+                )
 
-                else:
-                    support = self._calculate_support(
-                        slice_index, y_hat_slices, latent_means, latent_scales
-                    )
+                y_hat_i, _ = self._checkerboard_codec(
+                    y_strings[slice_index],
+                    slice_index,
+                    support,
+                    y_shape=(shape[0] * 4, shape[1] * 4),
+                    mode="decompress",
+                )
 
-                    y_hat_i, _ = self._checkerboard_codec(
-                        y_strings[slice_index],
-                        slice_index,
-                        support,
-                        y_shape=(shape[0] * 4, shape[1] * 4),
-                        mode="decompress",
-                    )
-
-                    y_hat_slices.append(y_hat_i)
+                y_hat_slices.append(y_hat_i)
 
                 # Warmup
                 if it > 0:
@@ -639,7 +755,11 @@ class SAREliC(CompressionModel):
         y_hat_for_gs = y_anchor_hat_for_gs + y_non_anchor_hat_for_gs
 
         # Entropy estimation
-        _, y_likelihood = self.gaussian_conditional(y, scales, means=means)
+        idx = torch.nonzero(y[0, :, 0, 0], as_tuple=True)[0]
+        y_sub = y[:, idx, :, :]
+        means_sub = means[:, idx, :, :]
+        scales_sub = scales[:, idx, :, :]
+        _, y_likelihood = self.gaussian_conditional(y_sub, scales_sub, means=means_sub)
 
         return y_hat, y_hat_for_gs, y_likelihood
 
@@ -690,81 +810,6 @@ class SAREliC(CompressionModel):
         y_strings = [anchor_strings, non_anchor_strings]
 
         return y_hat, y_strings
-
-
-    def _rle_bypass_likelihoods(self, y):
-        y_hat, y_hat_for_gs = self._apply_quantizer(y, 0, "noise")
-        vals, lens = rle_encode(y_hat)
-        vals_likelihood = [self.vals_p[sym] for sym in vals]
-        lens_likelihood = [self.lens_p[sym] for sym in lens]
-        
-        return y_hat, y_hat_for_gs, vals_likelihood, lens_likelihood
-
-
-    def _rle_bypass_encode(self, y, vals_codebook, lens_codebook, vals_min):
-        y_shape = y.shape
-        y_hat = torch.flatten(y).round().int().cpu().numpy()
-
-        vals, lens = rle_encode(y_hat)
-        # vals_min = np.min(vals)
-        vals_adj = vals - vals_min  # Make all values non-negative for encoding
-
-        # Exponential-Golomb
-        # vals_encoded = exp_golomb_encode_signed(vals)
-        # lens_encoded = exp_golomb_encode_unsigned(lens)
-
-        # Huffman
-        # vals_codebook = build_huffman_codebook(vals_adj)
-        # lens_codebook = build_huffman_codebook(lens)
-        vals_encoded = huffman_encode(vals_adj, vals_codebook)
-        lens_encoded = huffman_encode(lens, lens_codebook)
-
-        # Just passing the widths directly for now
-        # Should ultimately be a header or interleaved bitstream
-        # vals_len = len(vals_encoded)
-        # lens_len = len(lens_encoded)
-        y_strings = (vals_encoded, lens_encoded)
-
-        header = {
-            "y_shape": y_shape,
-            # "vals_len": vals_len,
-            # "lens_len": lens_len,
-            "vals_codebook": vals_codebook,
-            "lens_codebook": lens_codebook,
-            "vals_min": vals_min,
-        }
-
-        # Convert y_hat to tensor
-        y_hat = y_hat.reshape(y_shape)
-        y_hat = torch.from_numpy(y_hat).float().to(next(self.parameters()).device)
-
-        return y_strings, y_hat, header
-
-    def _rle_bypass_decode(self, y_strings, header, vals_codebook=[], lens_codebook=[], vals_min=0):
-        y_shape = header['y_shape']
-        # vals_len = header['vals_len']
-        # lens_len = header['lens_len']
-        # vals_encoded = y_strings[:vals_len]
-        # lens_encoded = y_strings[vals_len:(vals_len + lens_len)]
-        vals_encoded, lens_encoded = y_strings
-
-        # Exponential-Golomb
-        # vals_decoded = exp_golomb_decode_signed(vals_encoded)
-        # lens_decoded = exp_golomb_decode_unsigned(lens_encoded)
-
-        # Huffman
-        # vals_codebook = header['vals_codebook']
-        # lens_codebook = header['lens_codebook']
-        vals_decoded = huffman_decode(vals_encoded, vals_codebook)
-        lens_decoded = huffman_decode(lens_encoded, lens_codebook)
-
-        # vals_min = header['vals_min']
-        vals_decoded = np.array(vals_decoded) + vals_min  # Reverse adjustment
-        arr_decoded = rle_decode(vals_decoded, lens_decoded)
-
-        y_hat = torch.from_numpy(arr_decoded.reshape(y_shape)).float().to(next(self.parameters()).device)
-
-        return y_hat
 
     def _checkerboard_codec_step(
         self, y_input, slice_index, support, ctx_params, mode_codec, mode_step
